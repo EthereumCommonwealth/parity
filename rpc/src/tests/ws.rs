@@ -1,37 +1,35 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! WebSockets server tests.
 
 use std::sync::Arc;
 
-use devtools::http_client;
 use jsonrpc_core::MetaIoHandler;
-use rand;
 use ws;
 
 use v1::{extractors, informant};
 use tests::helpers::{GuardedAuthCodes, Server};
+use tests::http_client;
 
 /// Setup a mock signer for tests
 pub fn serve() -> (Server<ws::Server>, usize, GuardedAuthCodes) {
-	let port = 35000 + rand::random::<usize>() % 10000;
-	let address = format!("127.0.0.1:{}", port).parse().unwrap();
+	let address = "127.0.0.1:0".parse().unwrap();
 	let io = MetaIoHandler::default();
-	let authcodes = GuardedAuthCodes::new();
+	let authcodes = GuardedAuthCodes::default();
 	let stats = Arc::new(informant::RpcStats::default());
 
 	let res = Server::new(|_| ::start_ws(
@@ -44,6 +42,7 @@ pub fn serve() -> (Server<ws::Server>, usize, GuardedAuthCodes) {
 		extractors::WsExtractor::new(Some(&authcodes.path)),
 		extractors::WsStats::new(stats),
 	).unwrap());
+	let port = res.addr().port() as usize;
 
 	(res, port, authcodes)
 }
@@ -57,8 +56,7 @@ pub fn request(server: Server<ws::Server>, request: &str) -> http_client::Respon
 mod testing {
 	use std::time;
 	use hash::keccak;
-	use devtools::http_client;
-	use super::{serve, request};
+	use super::{serve, request, http_client};
 
 	#[test]
 	fn should_not_redirect_to_parity_host() {
@@ -77,7 +75,7 @@ mod testing {
 		);
 
 		// then
-		assert_eq!(response.status, "HTTP/1.1 200 Ok".to_owned());
+		assert_eq!(response.status, "HTTP/1.1 200 OK".to_owned());
 	}
 
 	#[test]

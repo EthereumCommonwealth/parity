@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Parity-specific rpc interface for operations altering the settings.
 //! Implementation for light client.
@@ -20,28 +20,32 @@
 use std::io;
 use std::sync::Arc;
 
-use sync::ManageNetwork;
+use ethereum_types::{H160, H256, U256};
 use fetch::{self, Fetch};
 use hash::keccak_buffer;
+use light::client::LightChainClient;
+use sync::ManageNetwork;
 
 use jsonrpc_core::{Result, BoxFuture};
 use jsonrpc_core::futures::Future;
 use v1::helpers::errors;
 use v1::traits::ParitySet;
-use v1::types::{Bytes, H160, H256, U256, ReleaseInfo, Transaction};
+use v1::types::{Bytes, ReleaseInfo, Transaction};
 
 /// Parity-specific rpc interface for operations altering the settings.
 pub struct ParitySetClient<F> {
+	client: Arc<LightChainClient>,
 	net: Arc<ManageNetwork>,
 	fetch: F,
 }
 
 impl<F: Fetch> ParitySetClient<F> {
 	/// Creates new `ParitySetClient` with given `Fetch`.
-	pub fn new(net: Arc<ManageNetwork>, fetch: F) -> Self {
+	pub fn new(client: Arc<LightChainClient>, net: Arc<ManageNetwork>, fetch: F) -> Self {
 		ParitySetClient {
-			net: net,
-			fetch: fetch,
+			client,
+			net,
+			fetch,
 		}
 	}
 }
@@ -67,7 +71,7 @@ impl<F: Fetch> ParitySet for ParitySetClient<F> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn set_engine_signer(&self, _address: H160, _password: String) -> Result<bool> {
+	fn set_engine_signer_secret(&self, _secret: H256) -> Result<bool> {
 		Err(errors::light_unimplemented(None))
 	}
 
@@ -117,8 +121,8 @@ impl<F: Fetch> ParitySet for ParitySetClient<F> {
 		Err(errors::light_unimplemented(None))
 	}
 
-	fn set_spec_name(&self, _spec_name: String) -> Result<bool> {
-		Err(errors::light_unimplemented(None))
+	fn set_spec_name(&self, spec_name: String) -> Result<bool> {
+		self.client.set_spec_name(spec_name).map(|_| true).map_err(|()| errors::cannot_restart())
 	}
 
 	fn hash_content(&self, url: String) -> BoxFuture<H256> {

@@ -1,24 +1,24 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Transaction Pool
 
 use ethereum_types::{U256, H256, Address};
 use heapsize::HeapSizeOf;
-use transaction;
+use types::transaction;
 use txpool;
 
 mod listener;
@@ -27,6 +27,7 @@ mod ready;
 
 pub mod client;
 pub mod local_transactions;
+pub mod replace;
 pub mod scoring;
 pub mod verifier;
 
@@ -121,7 +122,7 @@ pub trait ScoredTransaction {
 }
 
 /// Verified transaction stored in the pool.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTransaction {
 	transaction: transaction::PendingTransaction,
 	// TODO [ToDr] hash and sender should go directly from the transaction
@@ -197,4 +198,22 @@ impl ScoredTransaction for VerifiedTransaction {
 	fn nonce(&self) -> U256 {
 		self.transaction.nonce
 	}
+}
+
+/// Pool transactions status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TxStatus {
+	/// Added transaction
+	Added,
+	/// Rejected transaction
+	Rejected,
+	/// Dropped transaction
+	Dropped,
+	/// Invalid transaction
+	Invalid,
+	/// Canceled transaction
+	Canceled,
+	/// Culled transaction
+	Culled,
 }

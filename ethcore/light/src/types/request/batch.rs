@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Request chain builder utility.
 //! Push requests with `push`. Back-references and data required to verify responses must be
@@ -254,5 +254,64 @@ mod tests {
 		builder.push(Request::Receipts(IncompleteReceiptsRequest {
 			hash: Field::BackReference(0, 0),
 		})).unwrap();
+	}
+
+	#[test]
+	fn batch_tx_index_backreference() {
+		let mut builder = Builder::default();
+		builder.push(Request::HeaderProof(IncompleteHeaderProofRequest {
+			num: 100.into(), // header proof puts hash at output 0.
+		})).unwrap();
+		builder.push(Request::TransactionIndex(IncompleteTransactionIndexRequest {
+			hash: Field::BackReference(0, 0),
+		})).unwrap();
+
+		let mut batch = builder.build();
+		batch.requests[1].fill(|_req_idx, _out_idx| Ok(Output::Hash(42.into())));
+
+		assert!(batch.next_complete().is_some());
+		batch.answered += 1;
+		assert!(batch.next_complete().is_some());
+	}
+
+	#[test]
+	fn batch_tx_index_backreference_public_api() {
+		let mut builder = Builder::default();
+		builder.push(Request::HeaderProof(IncompleteHeaderProofRequest {
+			num: 100.into(), // header proof puts hash at output 0.
+		})).unwrap();
+		builder.push(Request::TransactionIndex(IncompleteTransactionIndexRequest {
+			hash: Field::BackReference(0, 0),
+		})).unwrap();
+
+		let mut batch = builder.build();
+
+		assert!(batch.next_complete().is_some());
+		let hdr_proof_res = header_proof::Response {
+			proof: vec![],
+			hash: 12.into(),
+			td: 21.into(),
+		};
+		batch.supply_response_unchecked(&hdr_proof_res);
+
+		assert!(batch.next_complete().is_some());
+	}
+
+	#[test]
+	fn batch_receipts_backreference() {
+		let mut builder = Builder::default();
+		builder.push(Request::HeaderProof(IncompleteHeaderProofRequest {
+			num: 100.into(), // header proof puts hash at output 0.
+		})).unwrap();
+		builder.push(Request::Receipts(IncompleteReceiptsRequest {
+			hash: Field::BackReference(0, 0),
+		})).unwrap();
+
+		let mut batch = builder.build();
+		batch.requests[1].fill(|_req_idx, _out_idx| Ok(Output::Hash(42.into())));
+
+		assert!(batch.next_complete().is_some());
+		batch.answered += 1;
+		assert!(batch.next_complete().is_some());
 	}
 }

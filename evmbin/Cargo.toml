@@ -9,15 +9,15 @@ name = "parity-evm"
 path = "./src/main.rs"
 
 [dependencies]
-docopt = "0.8"
+common-types = { path = "../ethcore/types" }
+docopt = "1.0"
 env_logger = "0.5"
-ethcore = { path = "../ethcore", features = ["test-helpers", "json-tests"] }
-ethjson = { path = "../json" }
-parity-bytes = "0.1"
-ethcore-transaction = { path = "../ethcore/transaction" }
+ethcore = { path = "../ethcore", features = ["test-helpers", "json-tests", "to-pod-full"] }
 ethereum-types = "0.4"
+ethjson = { path = "../json" }
 evm = { path = "../ethcore/evm" }
-panic_hook = { path = "../util/panic_hook" }
+panic_hook = { path = "../util/panic-hook" }
+parity-bytes = "0.1"
 rustc-hex = "1.0"
 serde = "1.0"
 serde_derive = "1.0"

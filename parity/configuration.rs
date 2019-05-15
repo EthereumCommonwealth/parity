@@ -1,24 +1,26 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::time::Duration;
 use std::io::Read;
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::collections::BTreeMap;
+use std::collections::{HashSet, BTreeMap};
+use std::iter::FromIterator;
 use std::cmp;
 use cli::{Args, ArgsError};
 use hash::keccak;
@@ -27,7 +29,7 @@ use parity_version::{version_data, version};
 use bytes::Bytes;
 use ansi_term::Colour;
 use sync::{NetworkConfiguration, validate_node_url, self};
-use ethcore::ethstore::ethkey::{Secret, Public};
+use ethkey::{Secret, Public};
 use ethcore::client::{VMType};
 use ethcore::miner::{stratum, MinerOptions};
 use ethcore::snapshot::SnapshotConfiguration;
@@ -38,7 +40,7 @@ use num_cpus;
 use rpc::{IpcConfiguration, HttpConfiguration, WsConfiguration};
 use parity_rpc::NetworkSettings;
 use cache::CacheConfig;
-use helpers::{to_duration, to_mode, to_block_id, to_u256, to_pending_set, to_price, geth_ipc_path, parity_ipc_path, to_bootnodes, to_addresses, to_address, to_queue_strategy, to_queue_penalization, passwords_from_files};
+use helpers::{to_duration, to_mode, to_block_id, to_u256, to_pending_set, to_price, geth_ipc_path, parity_ipc_path, to_bootnodes, to_addresses, to_address, to_queue_strategy, to_queue_penalization};
 use dir::helpers::{replace_home, replace_home_and_local};
 use params::{ResealPolicy, AccountsConfig, GasPricerConfig, MinerExtras, SpecType};
 use ethcore_logger::Config as LogConfig;
@@ -48,7 +50,7 @@ use ethcore_private_tx::{ProviderConfig, EncryptorConfig};
 use secretstore::{NodeSecretKey, Configuration as SecretStoreConfiguration, ContractAddress as SecretStoreContractAddress};
 use updater::{UpdatePolicy, UpdateFilter, ReleaseTrack};
 use run::RunCmd;
-use blockchain::{BlockchainCmd, ImportBlockchain, ExportBlockchain, KillBlockchain, ExportState, DataFormat};
+use blockchain::{BlockchainCmd, ImportBlockchain, ExportBlockchain, KillBlockchain, ExportState, DataFormat, ResetBlockchain};
 use export_hardcoded_sync::ExportHsyncCmd;
 use presale::ImportWallet;
 use account::{AccountCmd, NewAccount, ListAccounts, ImportAccounts, ImportFromGethAccounts};
@@ -138,9 +140,12 @@ impl Configuration {
 		let compaction = self.args.arg_db_compaction.parse()?;
 		let warp_sync = !self.args.flag_no_warp;
 		let geth_compatibility = self.args.flag_geth;
+		let experimental_rpcs = self.args.flag_jsonrpc_experimental;
 		let ipfs_conf = self.ipfs_config();
 		let secretstore_conf = self.secretstore_config()?;
 		let format = self.format()?;
+		let keys_iterations = NonZeroU32::new(self.args.arg_keys_iterations)
+			.ok_or_else(|| "--keys-iterations must be non-zero")?;
 
 		let cmd = if self.args.flag_version {
 			Cmd::Version
@@ -175,6 +180,19 @@ impl Configuration {
 			}
 		} else if self.args.cmd_tools && self.args.cmd_tools_hash {
 			Cmd::Hash(self.args.arg_tools_hash_file)
+		} else if self.args.cmd_db && self.args.cmd_db_reset {
+			Cmd::Blockchain(BlockchainCmd::Reset(ResetBlockchain {
+				dirs,
+				spec,
+				pruning,
+				pruning_history,
+				pruning_memory: self.args.arg_pruning_memory,
+				tracing,
+				fat_db,
+				compaction,
+				cache_config,
+				num: self.args.arg_db_reset_num,
+			}))
 		} else if self.args.cmd_db && self.args.cmd_db_kill {
 			Cmd::Blockchain(BlockchainCmd::Kill(KillBlockchain {
 				spec: spec,
@@ -184,7 +202,7 @@ impl Configuration {
 		} else if self.args.cmd_account {
 			let account_cmd = if self.args.cmd_account_new {
 				let new_acc = NewAccount {
-					iterations: self.args.arg_keys_iterations,
+					iterations: keys_iterations,
 					path: dirs.keys,
 					spec: spec,
 					password_file: self.accounts_config()?.password_files.first().map(|x| x.to_owned()),
@@ -218,7 +236,7 @@ impl Configuration {
 			Cmd::Account(account_cmd)
 		} else if self.args.cmd_wallet {
 			let presale_cmd = ImportWallet {
-				iterations: self.args.arg_keys_iterations,
+				iterations: keys_iterations,
 				path: dirs.keys,
 				spec: spec,
 				wallet_path: self.args.arg_wallet_import_path.clone().unwrap(),
@@ -369,6 +387,7 @@ impl Configuration {
 				miner_extras: self.miner_extras()?,
 				stratum: self.stratum_options()?,
 				update_policy: update_policy,
+				allow_missing_blocks: self.args.flag_jsonrpc_allow_missing_blocks,
 				mode: mode,
 				tracing: tracing,
 				fat_db: fat_db,
@@ -377,6 +396,7 @@ impl Configuration {
 				warp_sync: warp_sync,
 				warp_barrier: self.args.arg_warp_barrier,
 				geth_compatibility: geth_compatibility,
+				experimental_rpcs,
 				net_settings: self.network_settings()?,
 				ipfs_conf: ipfs_conf,
 				secretstore_conf: secretstore_conf,
@@ -394,8 +414,11 @@ impl Configuration {
 				whisper: whisper_config,
 				no_hardcoded_sync: self.args.flag_no_hardcoded_sync,
 				max_round_blocks_to_import: self.args.arg_max_round_blocks_to_import,
-				on_demand_retry_count: self.args.arg_on_demand_retry_count,
-				on_demand_inactive_time_limit: self.args.arg_on_demand_inactive_time_limit,
+				on_demand_response_time_window: self.args.arg_on_demand_response_time_window,
+				on_demand_request_backoff_start: self.args.arg_on_demand_request_backoff_start,
+				on_demand_request_backoff_max: self.args.arg_on_demand_request_backoff_max,
+				on_demand_request_backoff_rounds_max: self.args.arg_on_demand_request_backoff_rounds_max,
+				on_demand_request_consecutive_failures: self.args.arg_on_demand_request_consecutive_failures,
 			};
 			Cmd::Run(run_cmd)
 		};
@@ -419,6 +442,7 @@ impl Configuration {
 			gas_range_target: (floor, ceil),
 			engine_signer: self.engine_signer()?,
 			work_notify: self.work_notify(),
+			local_accounts: HashSet::from_iter(to_addresses(&self.args.arg_tx_queue_locals)?.into_iter()),
 		};
 
 		Ok(extras)
@@ -453,7 +477,8 @@ impl Configuration {
 		}
 	}
 
-	fn logger_config(&self) -> LogConfig {
+	/// returns logger config
+	pub fn logger_config(&self) -> LogConfig {
 		LogConfig {
 			mode: self.args.arg_logging.clone(),
 			color: !self.args.flag_no_color && !cfg!(windows),
@@ -469,6 +494,10 @@ impl Configuration {
 		};
 
 		Ok(name.parse()?)
+	}
+
+	fn is_dev_chain(&self) -> Result<bool, String> {
+		Ok(self.chain()? == SpecType::Dev)
 	}
 
 	fn max_peers(&self) -> u32 {
@@ -503,8 +532,10 @@ impl Configuration {
 	}
 
 	fn accounts_config(&self) -> Result<AccountsConfig, String> {
+		let keys_iterations = NonZeroU32::new(self.args.arg_keys_iterations)
+			.ok_or_else(|| "--keys-iterations must be non-zero")?;
 		let cfg = AccountsConfig {
-			iterations: self.args.arg_keys_iterations,
+			iterations: keys_iterations,
 			refresh_time: self.args.arg_accounts_refresh,
 			testnet: self.args.flag_testnet,
 			password_files: self.args.arg_password.iter().map(|s| replace_home(&self.directories().base, s)).collect(),
@@ -528,7 +559,7 @@ impl Configuration {
 	}
 
 	fn miner_options(&self) -> Result<MinerOptions, String> {
-		let is_dev_chain = self.chain()? == SpecType::Dev;
+		let is_dev_chain = self.is_dev_chain()?;
 		if is_dev_chain && self.args.flag_force_sealing && self.args.arg_reseal_min_period == 0 {
 			return Err("Force sealing can't be used with reseal_min_period = 0".into());
 		}
@@ -607,6 +638,7 @@ impl Configuration {
 			http_port: self.args.arg_ports_shift + self.args.arg_secretstore_http_port,
 			data_path: self.directories().secretstore,
 			admin_public: self.secretstore_admin_public()?,
+			cors: self.secretstore_cors()
 		})
 	}
 
@@ -882,23 +914,17 @@ impl Configuration {
 	}
 
 	fn private_provider_config(&self) -> Result<(ProviderConfig, EncryptorConfig, bool), String> {
+		let dirs = self.directories();
 		let provider_conf = ProviderConfig {
 			validator_accounts: to_addresses(&self.args.arg_private_validators)?,
 			signer_account: self.args.arg_private_signer.clone().and_then(|account| to_address(Some(account)).ok()),
-			passwords: match self.args.arg_private_passwords.clone() {
-				Some(file) => passwords_from_files(&vec![file].as_slice())?,
-				None => Vec::new(),
-			},
+			logs_path: Some(dirs.base),
 		};
 
 		let encryptor_conf = EncryptorConfig {
 			base_url: self.args.arg_private_sstore_url.clone(),
 			threshold: self.args.arg_private_sstore_threshold.unwrap_or(0),
 			key_server_account: self.args.arg_private_account.clone().and_then(|account| to_address(Some(account)).ok()),
-			passwords: match self.args.arg_private_passwords.clone() {
-				Some(file) => passwords_from_files(&vec![file].as_slice())?,
-				None => Vec::new(),
-			},
 		};
 
 		Ok((provider_conf, encryptor_conf, self.args.flag_private_enabled))
@@ -922,6 +948,7 @@ impl Configuration {
 		Ok(NetworkSettings {
 			name: self.args.arg_identity.clone(),
 			chain: format!("{}", self.chain()?),
+			is_dev_chain: self.is_dev_chain()?,
 			network_port: net_addresses.0.port(),
 			rpc_enabled: http_conf.enabled,
 			rpc_interface: http_conf.interface,
@@ -1034,10 +1061,15 @@ impl Configuration {
 		self.interface(&self.args.arg_secretstore_http_interface)
 	}
 
+	fn secretstore_cors(&self) -> Option<Vec<String>> {
+		Self::cors(self.args.arg_secretstore_http_cors.as_ref())
+	}
+
 	fn secretstore_self_secret(&self) -> Result<Option<NodeSecretKey>, String> {
 		match self.args.arg_secretstore_secret {
 			Some(ref s) if s.len() == 64 => Ok(Some(NodeSecretKey::Plain(s.parse()
 				.map_err(|e| format!("Invalid secret store secret: {}. Error: {:?}", s, e))?))),
+			#[cfg(feature = "accounts")]
 			Some(ref s) if s.len() == 40 => Ok(Some(NodeSecretKey::KeyStore(s.parse()
 				.map_err(|e| format!("Invalid secret store secret address: {}. Error: {:?}", s, e))?))),
 			Some(_) => Err(format!("Invalid secret store secret. Must be either existing account address, or hex-encoded private key")),
@@ -1185,6 +1217,10 @@ mod tests {
 
 	use super::*;
 
+	lazy_static! {
+		static ref ITERATIONS: NonZeroU32 = NonZeroU32::new(10240).expect("10240 > 0; qed");
+	}
+
 	#[derive(Debug, PartialEq)]
 	struct TestPasswordReader(&'static str);
 
@@ -1206,7 +1242,7 @@ mod tests {
 		let args = vec!["parity", "account", "new"];
 		let conf = parse(&args);
 		assert_eq!(conf.into_command().unwrap().cmd, Cmd::Account(AccountCmd::New(NewAccount {
-			iterations: 10240,
+			iterations: *ITERATIONS,
 			path: Directories::default().keys,
 			password_file: None,
 			spec: SpecType::default(),
@@ -1241,7 +1277,7 @@ mod tests {
 		let args = vec!["parity", "wallet", "import", "my_wallet.json", "--password", "pwd"];
 		let conf = parse(&args);
 		assert_eq!(conf.into_command().unwrap().cmd, Cmd::ImportPresaleWallet(ImportWallet {
-			iterations: 10240,
+			iterations: *ITERATIONS,
 			path: Directories::default().keys,
 			wallet_path: "my_wallet.json".into(),
 			password_file: Some("pwd".into()),
@@ -1383,6 +1419,7 @@ mod tests {
 		let args = vec!["parity"];
 		let conf = parse(&args);
 		let mut expected = RunCmd {
+			allow_missing_blocks: false,
 			cache_config: Default::default(),
 			dirs: Default::default(),
 			spec: Default::default(),
@@ -1419,10 +1456,15 @@ mod tests {
 			compaction: Default::default(),
 			vm_type: Default::default(),
 			geth_compatibility: false,
+			experimental_rpcs: false,
 			net_settings: Default::default(),
 			ipfs_conf: Default::default(),
 			secretstore_conf: Default::default(),
-			private_provider_conf: Default::default(),
+			private_provider_conf: ProviderConfig {
+				validator_accounts: Default::default(),
+				signer_account: Default::default(),
+				logs_path: Some(Directories::default().base),
+			},
 			private_encryptor_conf: Default::default(),
 			private_tx_enabled: false,
 			name: "".into(),
@@ -1439,8 +1481,11 @@ mod tests {
 			no_persistent_txqueue: false,
 			whisper: Default::default(),
 			max_round_blocks_to_import: 12,
-			on_demand_retry_count: None,
-			on_demand_inactive_time_limit: None,
+			on_demand_response_time_window: None,
+			on_demand_request_backoff_start: None,
+			on_demand_request_backoff_max: None,
+			on_demand_request_backoff_rounds_max: None,
+			on_demand_request_consecutive_failures: None,
 		};
 		expected.secretstore_conf.enabled = cfg!(feature = "secretstore");
 		expected.secretstore_conf.http_enabled = cfg!(feature = "secretstore");
@@ -1522,6 +1567,7 @@ mod tests {
 		assert_eq!(conf.network_settings(), Ok(NetworkSettings {
 			name: "testname".to_owned(),
 			chain: "kovan".to_owned(),
+			is_dev_chain: false,
 			network_port: 30303,
 			rpc_enabled: true,
 			rpc_interface: "127.0.0.1".to_owned(),
@@ -1933,5 +1979,20 @@ mod tests {
 			},
 			_ => panic!("Should be Cmd::Run"),
 		}
+	}
+
+	#[test]
+	fn should_parse_secretstore_cors() {
+		// given
+
+		// when
+		let conf0 = parse(&["parity"]);
+		let conf1 = parse(&["parity", "--secretstore-http-cors", "*"]);
+		let conf2 = parse(&["parity", "--secretstore-http-cors", "http://parity.io,http://something.io"]);
+
+		// then
+		assert_eq!(conf0.secretstore_cors(), Some(vec![]));
+		assert_eq!(conf1.secretstore_cors(), None);
+		assert_eq!(conf2.secretstore_cors(), Some(vec!["http://parity.io".into(),"http://something.io".into()]));
 	}
 }

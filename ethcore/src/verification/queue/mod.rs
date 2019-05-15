@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! A queue of blocks. Sits between network or other I/O and the `BlockChain`.
 //! Sorts them ready for blockchain insertion.
@@ -26,9 +26,10 @@ use heapsize::HeapSizeOf;
 use ethereum_types::{H256, U256};
 use parking_lot::{Condvar, Mutex, RwLock};
 use io::*;
-use error::{BlockError, ImportErrorKind, ErrorKind, Error};
+use error::{BlockError, ImportError, Error};
 use engines::EthEngine;
 use client::ClientIoMessage;
+use len_caching_lock::LenCachingMutex;
 
 use self::kind::{BlockLike, Kind};
 
@@ -116,9 +117,9 @@ pub enum Status {
 	Unknown,
 }
 
-impl Into<::block_status::BlockStatus> for Status {
-	fn into(self) -> ::block_status::BlockStatus {
-		use ::block_status::BlockStatus;
+impl Into<::types::block_status::BlockStatus> for Status {
+	fn into(self) -> ::types::block_status::BlockStatus {
+		use ::types::block_status::BlockStatus;
 		match self {
 			Status::Queued => BlockStatus::Queued,
 			Status::Bad => BlockStatus::Bad,
@@ -195,9 +196,9 @@ impl QueueSignal {
 
 struct Verification<K: Kind> {
 	// All locks must be captured in the order declared here.
-	unverified: Mutex<VecDeque<K::Unverified>>,
-	verifying: Mutex<VecDeque<Verifying<K>>>,
-	verified: Mutex<VecDeque<K::Verified>>,
+	unverified: LenCachingMutex<VecDeque<K::Unverified>>,
+	verifying: LenCachingMutex<VecDeque<Verifying<K>>>,
+	verified: LenCachingMutex<VecDeque<K::Verified>>,
 	bad: Mutex<HashSet<H256>>,
 	sizes: Sizes,
 	check_seal: bool,
@@ -207,9 +208,9 @@ impl<K: Kind> VerificationQueue<K> {
 	/// Creates a new queue instance.
 	pub fn new(config: Config, engine: Arc<EthEngine>, message_channel: IoChannel<ClientIoMessage>, check_seal: bool) -> Self {
 		let verification = Arc::new(Verification {
-			unverified: Mutex::new(VecDeque::new()),
-			verifying: Mutex::new(VecDeque::new()),
-			verified: Mutex::new(VecDeque::new()),
+			unverified: LenCachingMutex::new(VecDeque::new()),
+			verifying: LenCachingMutex::new(VecDeque::new()),
+			verified: LenCachingMutex::new(VecDeque::new()),
 			bad: Mutex::new(HashSet::new()),
 			sizes: Sizes {
 				unverified: AtomicUsize::new(0),
@@ -332,7 +333,7 @@ impl<K: Kind> VerificationQueue<K> {
 						return;
 					}
 
-					wait.wait(&mut unverified);
+					wait.wait(unverified.inner_mut());
 				}
 
 				if let State::Exit = *state.0.lock() {
@@ -453,7 +454,7 @@ impl<K: Kind> VerificationQueue<K> {
 	pub fn flush(&self) {
 		let mut unverified = self.verification.unverified.lock();
 		while !unverified.is_empty() || !self.verification.verifying.lock().is_empty() {
-			self.empty.wait(&mut unverified);
+			self.empty.wait(unverified.inner_mut());
 		}
 	}
 
@@ -473,17 +474,17 @@ impl<K: Kind> VerificationQueue<K> {
 		let hash = input.hash();
 		{
 			if self.processing.read().contains_key(&hash) {
-				bail!((input, ErrorKind::Import(ImportErrorKind::AlreadyQueued).into()));
+				return Err((input, Error::Import(ImportError::AlreadyQueued).into()));
 			}
 
 			let mut bad = self.verification.bad.lock();
 			if bad.contains(&hash) {
-				bail!((input, ErrorKind::Import(ImportErrorKind::KnownBad).into()));
+				return Err((input, Error::Import(ImportError::KnownBad).into()));
 			}
 
 			if bad.contains(&input.parent_hash()) {
 				bad.insert(hash);
-				bail!((input, ErrorKind::Import(ImportErrorKind::KnownBad).into()));
+				return Err((input, Error::Import(ImportError::KnownBad).into()));
 			}
 		}
 
@@ -503,7 +504,7 @@ impl<K: Kind> VerificationQueue<K> {
 			Err((input, err)) => {
 				match err {
 					// Don't mark future blocks as bad.
-					Error(ErrorKind::Block(BlockError::TemporarilyInvalid(_)), _) => {},
+					Error::Block(BlockError::TemporarilyInvalid(_)) => {},
 					_ => {
 						self.verification.bad.lock().insert(hash);
 					}
@@ -583,23 +584,32 @@ impl<K: Kind> VerificationQueue<K> {
 		result
 	}
 
+	/// Returns true if there is nothing currently in the queue.
+	pub fn is_empty(&self) -> bool {
+		let v = &self.verification;
+
+		v.unverified.load_len() == 0
+			&& v.verifying.load_len() == 0
+			&& v.verified.load_len() == 0
+	}
+
 	/// Get queue status.
 	pub fn queue_info(&self) -> QueueInfo {
 		use std::mem::size_of;
 
 		let (unverified_len, unverified_bytes) = {
-			let len = self.verification.unverified.lock().len();
+			let len = self.verification.unverified.load_len();
 			let size = self.verification.sizes.unverified.load(AtomicOrdering::Acquire);
 
 			(len, size + len * size_of::<K::Unverified>())
 		};
 		let (verifying_len, verifying_bytes) = {
-			let len = self.verification.verifying.lock().len();
+			let len = self.verification.verifying.load_len();
 			let size = self.verification.sizes.verifying.load(AtomicOrdering::Acquire);
 			(len, size + len * size_of::<Verifying<K>>())
 		};
 		let (verified_len, verified_bytes) = {
-			let len = self.verification.verified.lock().len();
+			let len = self.verification.verified.load_len();
 			let size = self.verification.sizes.verified.load(AtomicOrdering::Acquire);
 			(len, size + len * size_of::<K::Verified>())
 		};
@@ -734,8 +744,9 @@ mod tests {
 	use super::kind::blocks::Unverified;
 	use test_helpers::{get_good_dummy_block_seq, get_good_dummy_block};
 	use error::*;
-	use views::BlockView;
 	use bytes::Bytes;
+	use types::view;
+	use types::views::BlockView;
 
 	// create a test block queue.
 	// auto_scaling enables verifier adjustment.
@@ -786,7 +797,7 @@ mod tests {
 		match duplicate_import {
 			Err((_, e)) => {
 				match e {
-					Error(ErrorKind::Import(ImportErrorKind::AlreadyQueued), _) => {},
+					Error::Import(ImportError::AlreadyQueued) => {},
 					_ => { panic!("must return AlreadyQueued error"); }
 				}
 			}

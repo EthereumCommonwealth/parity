@@ -1,27 +1,28 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::Arc;
 
 use serde::{Serialize, Serializer};
 use serde::ser::SerializeStruct;
 use ethcore::{contract_address, CreateContractAddress};
+use ethereum_types::{H160, H256, H512, U64, U256};
 use miner;
-use transaction::{LocalizedTransaction, Action, PendingTransaction, SignedTransaction};
-use v1::types::{Bytes, H160, H256, U256, H512, U64, TransactionCondition};
+use types::transaction::{LocalizedTransaction, Action, PendingTransaction, SignedTransaction};
+use v1::types::{Bytes, TransactionCondition};
 
 /// Transaction
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
@@ -176,22 +177,22 @@ impl Transaction {
 		let signature = t.signature();
 		let scheme = CreateContractAddress::FromSenderAndNonce;
 		Transaction {
-			hash: t.hash().into(),
-			nonce: t.nonce.into(),
-			block_hash: Some(t.block_hash.clone().into()),
+			hash: t.hash(),
+			nonce: t.nonce,
+			block_hash: Some(t.block_hash),
 			block_number: Some(t.block_number.into()),
 			transaction_index: Some(t.transaction_index.into()),
-			from: t.sender().into(),
+			from: t.sender(),
 			to: match t.action {
 				Action::Create => None,
-				Action::Call(ref address) => Some(address.clone().into())
+				Action::Call(ref address) => Some(*address)
 			},
-			value: t.value.into(),
-			gas_price: t.gas_price.into(),
-			gas: t.gas.into(),
+			value: t.value,
+			gas_price: t.gas_price,
+			gas: t.gas,
 			input: Bytes::new(t.data.clone()),
 			creates: match t.action {
-				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0.into()),
+				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0),
 				Action::Call(_) => None,
 			},
 			raw: ::rlp::encode(&t.signed).into(),
@@ -210,22 +211,22 @@ impl Transaction {
 		let signature = t.signature();
 		let scheme = CreateContractAddress::FromSenderAndNonce;
 		Transaction {
-			hash: t.hash().into(),
-			nonce: t.nonce.into(),
+			hash: t.hash(),
+			nonce: t.nonce,
 			block_hash: None,
 			block_number: None,
 			transaction_index: None,
-			from: t.sender().into(),
+			from: t.sender(),
 			to: match t.action {
 				Action::Create => None,
-				Action::Call(ref address) => Some(address.clone().into())
+				Action::Call(ref address) => Some(*address)
 			},
-			value: t.value.into(),
-			gas_price: t.gas_price.into(),
-			gas: t.gas.into(),
+			value: t.value,
+			gas_price: t.gas_price,
+			gas: t.gas,
 			input: Bytes::new(t.data.clone()),
 			creates: match t.action {
-				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0.into()),
+				Action::Create => Some(contract_address(scheme, &t.sender(), &t.nonce, &t.data).0),
 				Action::Call(_) => None,
 			},
 			raw: ::rlp::encode(&t).into(),
@@ -242,7 +243,7 @@ impl Transaction {
 	/// Convert `PendingTransaction` into RPC Transaction.
 	pub fn from_pending(t: PendingTransaction) -> Transaction {
 		let mut r = Transaction::from_signed(t.transaction);
-		r.condition = t.condition.map(|b| b.into());
+		r.condition = r.condition.map(Into::into);
 		r
 	}
 }
@@ -264,8 +265,8 @@ impl LocalTransactionStatus {
 			Canceled(tx) => LocalTransactionStatus::Canceled(convert(tx)),
 			Replaced { old, new } => LocalTransactionStatus::Replaced(
 				convert(old),
-				new.signed().gas_price.into(),
-				new.signed().hash().into(),
+				new.signed().gas_price,
+				new.signed().hash(),
 			),
 		}
 	}

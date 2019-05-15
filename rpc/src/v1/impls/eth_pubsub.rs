@@ -1,48 +1,48 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Eth PUB-SUB rpc implementation.
 
 use std::sync::{Arc, Weak};
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use jsonrpc_core::{BoxFuture, Result, Error};
-use jsonrpc_core::futures::{self, Future, IntoFuture};
-use jsonrpc_macros::Trailing;
-use jsonrpc_macros::pubsub::{Sink, Subscriber};
+use jsonrpc_core::futures::{self, Future, IntoFuture, Stream};
+use jsonrpc_pubsub::typed::{Sink, Subscriber};
 use jsonrpc_pubsub::SubscriptionId;
 
-use v1::helpers::{errors, limit_logs, Subscribers};
+use v1::helpers::{errors, limit_logs, Subscribers, };
 use v1::helpers::light_fetch::LightFetch;
 use v1::metadata::Metadata;
 use v1::traits::EthPubSub;
 use v1::types::{pubsub, RichHeader, Log};
 
-use ethcore::encoded;
-use ethcore::filter::Filter as EthFilter;
-use ethcore::client::{BlockChainClient, ChainNotify, ChainRoute, ChainRouteType, BlockId};
-use sync::LightSync;
-use light::cache::Cache;
-use light::on_demand::OnDemand;
-use light::client::{LightChainClient, LightChainNotify};
-use parity_runtime::Executor;
+use sync::{SyncState, Notification};
+use ethcore::client::{BlockChainClient, ChainNotify, NewBlocks, ChainRouteType, BlockId};
 use ethereum_types::H256;
-use bytes::Bytes;
+use light::cache::Cache;
+use light::client::{LightChainClient, LightChainNotify};
+use light::on_demand::OnDemandRequester;
+use parity_runtime::Executor;
 use parking_lot::{RwLock, Mutex};
+
+use sync::{LightSyncProvider, LightNetworkDispatcher, ManageNetwork};
+
+use types::encoded;
+use types::filter::Filter as EthFilter;
 
 type Client = Sink<pubsub::Result>;
 
@@ -52,6 +52,30 @@ pub struct EthPubSubClient<C> {
 	heads_subscribers: Arc<RwLock<Subscribers<Client>>>,
 	logs_subscribers: Arc<RwLock<Subscribers<(Client, EthFilter)>>>,
 	transactions_subscribers: Arc<RwLock<Subscribers<Client>>>,
+	sync_subscribers: Arc<RwLock<Subscribers<Client>>>,
+}
+
+impl<C> EthPubSubClient<C>
+	where
+		C: 'static + Send + Sync
+{
+	/// adds a sync notification channel to the pubsub client
+	pub fn add_sync_notifier<F>(&mut self, receiver: Notification<SyncState>, f: F)
+		where
+			F: 'static + Fn(SyncState) -> Option<pubsub::PubSubSyncStatus> + Send
+	{
+		let handler = self.handler.clone();
+
+		self.handler.executor.spawn(
+			receiver.for_each(move |state| {
+				if let Some(status) = f(state) {
+					handler.notify_syncing(status);
+					return Ok(())
+				}
+				Err(())
+			})
+		)
+	}
 }
 
 impl<C> EthPubSubClient<C> {
@@ -60,6 +84,7 @@ impl<C> EthPubSubClient<C> {
 		let heads_subscribers = Arc::new(RwLock::new(Subscribers::default()));
 		let logs_subscribers = Arc::new(RwLock::new(Subscribers::default()));
 		let transactions_subscribers = Arc::new(RwLock::new(Subscribers::default()));
+		let sync_subscribers = Arc::new(RwLock::new(Subscribers::default()));
 
 		EthPubSubClient {
 			handler: Arc::new(ChainNotificationHandler {
@@ -68,7 +93,9 @@ impl<C> EthPubSubClient<C> {
 				heads_subscribers: heads_subscribers.clone(),
 				logs_subscribers: logs_subscribers.clone(),
 				transactions_subscribers: transactions_subscribers.clone(),
+				sync_subscribers: sync_subscribers.clone(),
 			}),
+			sync_subscribers,
 			heads_subscribers,
 			logs_subscribers,
 			transactions_subscribers,
@@ -82,6 +109,7 @@ impl<C> EthPubSubClient<C> {
 		*client.heads_subscribers.write() = Subscribers::new_test();
 		*client.logs_subscribers.write() = Subscribers::new_test();
 		*client.transactions_subscribers.write() = Subscribers::new_test();
+		*client.sync_subscribers.write() = Subscribers::new_test();
 		client
 	}
 
@@ -91,12 +119,16 @@ impl<C> EthPubSubClient<C> {
 	}
 }
 
-impl EthPubSubClient<LightFetch> {
+impl<S, OD> EthPubSubClient<LightFetch<S, OD>>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	/// Creates a new `EthPubSubClient` for `LightClient`.
 	pub fn light(
 		client: Arc<LightChainClient>,
-		on_demand: Arc<OnDemand>,
-		sync: Arc<LightSync>,
+		on_demand: Arc<OD>,
+		sync: Arc<S>,
 		cache: Arc<Mutex<Cache>>,
 		executor: Executor,
 		gas_price_percentile: usize,
@@ -119,6 +151,7 @@ pub struct ChainNotificationHandler<C> {
 	heads_subscribers: Arc<RwLock<Subscribers<Client>>>,
 	logs_subscribers: Arc<RwLock<Subscribers<(Client, EthFilter)>>>,
 	transactions_subscribers: Arc<RwLock<Subscribers<Client>>>,
+	sync_subscribers: Arc<RwLock<Subscribers<Client>>>,
 }
 
 impl<C> ChainNotificationHandler<C> {
@@ -133,11 +166,17 @@ impl<C> ChainNotificationHandler<C> {
 	fn notify_heads(&self, headers: &[(encoded::Header, BTreeMap<String, String>)]) {
 		for subscriber in self.heads_subscribers.read().values() {
 			for &(ref header, ref extra_info) in headers {
-				Self::notify(&self.executor, subscriber, pubsub::Result::Header(RichHeader {
+				Self::notify(&self.executor, subscriber, pubsub::Result::Header(Box::new(RichHeader {
 					inner: header.into(),
 					extra_info: extra_info.clone(),
-				}));
+				})));
 			}
+		}
+	}
+
+	fn notify_syncing(&self, sync_status: pubsub::PubSubSyncStatus) {
+		for subscriber in self.sync_subscribers.read().values() {
+			Self::notify(&self.executor, subscriber, pubsub::Result::SyncState(sync_status.clone()));
 		}
 	}
 
@@ -153,7 +192,7 @@ impl<C> ChainNotificationHandler<C> {
 				.map(|&(hash, ref ex)| {
 					let mut filter = filter.clone();
 					filter.from_block = BlockId::Hash(hash);
-					filter.to_block = filter.from_block.clone();
+					filter.to_block = filter.from_block;
 					logs(filter, ex).into_future()
 				})
 				.collect::<Vec<_>>()
@@ -166,7 +205,7 @@ impl<C> ChainNotificationHandler<C> {
 					let logs = logs.into_iter().flat_map(|log| log).collect();
 
 					for log in limit_logs(logs, limit) {
-						Self::notify(&executor, &subscriber, pubsub::Result::Log(log))
+						Self::notify(&executor, &subscriber, pubsub::Result::Log(Box::new(log)))
 					}
 				})
 				.map_err(|e| warn!("Unable to fetch latest logs: {:?}", e))
@@ -178,7 +217,7 @@ impl<C> ChainNotificationHandler<C> {
 	pub fn notify_new_transactions(&self, hashes: &[H256]) {
 		for subscriber in self.transactions_subscribers.read().values() {
 			for hash in hashes {
-				Self::notify(&self.executor, subscriber, pubsub::Result::TransactionHash((*hash).into()));
+				Self::notify(&self.executor, subscriber, pubsub::Result::TransactionHash(*hash));
 			}
 		}
 	}
@@ -193,7 +232,11 @@ pub trait LightClient: Send + Sync {
 	fn logs(&self, filter: EthFilter) -> BoxFuture<Vec<Log>>;
 }
 
-impl LightClient for LightFetch {
+impl<S, OD> LightClient for LightFetch<S, OD>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	fn block_header(&self, id: BlockId) -> Option<encoded::Header> {
 		self.client.block_header(id)
 	}
@@ -204,10 +247,7 @@ impl LightClient for LightFetch {
 }
 
 impl<C: LightClient> LightChainNotify for ChainNotificationHandler<C> {
-	fn new_headers(
-		&self,
-		enacted: &[H256],
-	) {
+	fn new_headers(&self, enacted: &[H256]) {
 		let headers = enacted
 			.iter()
 			.filter_map(|hash| self.client.block_header(BlockId::Hash(*hash)))
@@ -220,23 +260,15 @@ impl<C: LightClient> LightChainNotify for ChainNotificationHandler<C> {
 }
 
 impl<C: BlockChainClient> ChainNotify for ChainNotificationHandler<C> {
-	fn new_blocks(
-		&self,
-		_imported: Vec<H256>,
-		_invalid: Vec<H256>,
-		route: ChainRoute,
-		_sealed: Vec<H256>,
-		// Block bytes.
-		_proposed: Vec<Bytes>,
-		_duration: Duration,
-	) {
-		const EXTRA_INFO_PROOF: &'static str = "Object exists in in blockchain (fetched earlier), extra_info is always available if object exists; qed";
-		let headers = route.route()
+	fn new_blocks(&self, new_blocks: NewBlocks) {
+		if self.heads_subscribers.read().is_empty() && self.logs_subscribers.read().is_empty() { return }
+		const EXTRA_INFO_PROOF: &str = "Object exists in in blockchain (fetched earlier), extra_info is always available if object exists; qed";
+		let headers = new_blocks.route.route()
 			.iter()
 			.filter_map(|&(hash, ref typ)| {
 				match typ {
-					&ChainRouteType::Retracted => None,
-					&ChainRouteType::Enacted => self.client.block_header(BlockId::Hash(hash))
+					ChainRouteType::Retracted => None,
+					ChainRouteType::Enacted => self.client.block_header(BlockId::Hash(hash))
 				}
 			})
 			.map(|header| {
@@ -249,11 +281,11 @@ impl<C: BlockChainClient> ChainNotify for ChainNotificationHandler<C> {
 		self.notify_heads(&headers);
 
 		// We notify logs enacting and retracting as the order in route.
-		self.notify_logs(route.route(), |filter, ex| {
+		self.notify_logs(new_blocks.route.route(), |filter, ex| {
 			match ex {
-				&ChainRouteType::Enacted =>
+				ChainRouteType::Enacted =>
 					Ok(self.client.logs(filter).unwrap_or_default().into_iter().map(Into::into).collect()),
-				&ChainRouteType::Retracted =>
+				ChainRouteType::Retracted =>
 					Ok(self.client.logs(filter).unwrap_or_default().into_iter().map(Into::into).map(|mut log: Log| {
 						log.log_type = "removed".into();
 						log.removed = true;
@@ -272,11 +304,15 @@ impl<C: Send + Sync + 'static> EthPubSub for EthPubSubClient<C> {
 		_meta: Metadata,
 		subscriber: Subscriber<pubsub::Result>,
 		kind: pubsub::Kind,
-		params: Trailing<pubsub::Params>,
+		params: Option<pubsub::Params>,
 	) {
-		let error = match (kind, params.into()) {
+		let error = match (kind, params) {
 			(pubsub::Kind::NewHeads, None) => {
 				self.heads_subscribers.write().push(subscriber);
+				return;
+			},
+			(pubsub::Kind::Syncing, None) => {
+				self.sync_subscribers.write().push(subscriber);
 				return;
 			},
 			(pubsub::Kind::NewHeads, _) => {
@@ -309,11 +345,12 @@ impl<C: Send + Sync + 'static> EthPubSub for EthPubSubClient<C> {
 		let _ = subscriber.reject(error);
 	}
 
-	fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
+	fn unsubscribe(&self, _: Option<Self::Metadata>, id: SubscriptionId) -> Result<bool> {
 		let res = self.heads_subscribers.write().remove(&id).is_some();
 		let res2 = self.logs_subscribers.write().remove(&id).is_some();
 		let res3 = self.transactions_subscribers.write().remove(&id).is_some();
+		let res4 = self.sync_subscribers.write().remove(&id).is_some();
 
-		Ok(res || res2 || res3)
+		Ok(res || res2 || res3 || res4)
 	}
 }

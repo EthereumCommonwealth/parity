@@ -1,50 +1,52 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Set of different helpers for client tests
 
 use std::path::Path;
 use std::sync::Arc;
 use std::{fs, io};
-use account_provider::AccountProvider;
-use ethereum_types::{H256, U256, Address};
-use block::{OpenBlock, Drain};
+
 use blockchain::{BlockChain, BlockChainDB, BlockChainDBHandler, Config as BlockChainConfig, ExtrasInsert};
+use blooms_db;
 use bytes::Bytes;
-use client::{Client, ClientConfig, ChainInfo, ImportBlock, ChainNotify, ChainMessageType, PrepareOpenBlock};
+use ethereum_types::{H256, U256, Address};
 use ethkey::KeyPair;
 use evm::Factory as EvmFactory;
-use factory::Factories;
 use hash::keccak;
-use header::Header;
-use io::*;
-use miner::Miner;
+use io::IoChannel;
+use kvdb::KeyValueDB;
+use kvdb_rocksdb::{self, Database, DatabaseConfig};
 use parking_lot::RwLock;
 use rlp::{self, RlpStream};
-use spec::Spec;
-use state_db::StateDB;
-use state::*;
-use transaction::{Action, Transaction, SignedTransaction};
-use views::BlockView;
-use blooms_db;
-use kvdb::KeyValueDB;
-use kvdb_rocksdb;
 use tempdir::TempDir;
+use types::transaction::{Action, Transaction, SignedTransaction};
+use types::encoded;
+use types::header::Header;
+use types::view;
+use types::views::BlockView;
+
+use block::{OpenBlock, Drain};
+use client::{Client, ClientConfig, ChainInfo, ImportBlock, ChainNotify, ChainMessageType, PrepareOpenBlock};
+use factory::Factories;
+use miner::Miner;
+use spec::Spec;
+use state::*;
+use state_db::StateDB;
 use verification::queue::kind::blocks::Unverified;
-use encoded;
 
 /// Creates test block with corresponding header
 pub fn create_test_block(header: &Header) -> Bytes {
@@ -106,18 +108,15 @@ pub fn generate_dummy_client_with_data(block_number: u32, txs_per_block: usize, 
 	generate_dummy_client_with_spec_and_data(Spec::new_null, block_number, txs_per_block, tx_gas_prices)
 }
 
-/// Generates dummy client (not test client) with corresponding amount of blocks, txs per block and spec
-pub fn generate_dummy_client_with_spec_and_data<F>(test_spec: F, block_number: u32, txs_per_block: usize, tx_gas_prices: &[U256]) -> Arc<Client> where F: Fn()->Spec {
-	generate_dummy_client_with_spec_accounts_and_data(test_spec, None, block_number, txs_per_block, tx_gas_prices)
-}
-
 /// Generates dummy client (not test client) with corresponding spec and accounts
-pub fn generate_dummy_client_with_spec_and_accounts<F>(test_spec: F, accounts: Option<Arc<AccountProvider>>) -> Arc<Client> where F: Fn()->Spec {
-	generate_dummy_client_with_spec_accounts_and_data(test_spec, accounts, 0, 0, &[])
+pub fn generate_dummy_client_with_spec<F>(test_spec: F) -> Arc<Client> where F: Fn()->Spec {
+	generate_dummy_client_with_spec_and_data(test_spec, 0, 0, &[])
 }
 
-/// Generates dummy client (not test client) with corresponding blocks, accounts and spec
-pub fn generate_dummy_client_with_spec_accounts_and_data<F>(test_spec: F, accounts: Option<Arc<AccountProvider>>, block_number: u32, txs_per_block: usize, tx_gas_prices: &[U256]) -> Arc<Client> where F: Fn()->Spec {
+/// Generates dummy client (not test client) with corresponding amount of blocks, txs per block and spec
+pub fn generate_dummy_client_with_spec_and_data<F>(test_spec: F, block_number: u32, txs_per_block: usize, tx_gas_prices: &[U256]) -> Arc<Client> where
+	F: Fn() -> Spec
+{
 	let test_spec = test_spec();
 	let client_db = new_db();
 
@@ -125,7 +124,7 @@ pub fn generate_dummy_client_with_spec_accounts_and_data<F>(test_spec: F, accoun
 		ClientConfig::default(),
 		&test_spec,
 		client_db,
-		Arc::new(Miner::new_for_tests(&test_spec, accounts)),
+		Arc::new(Miner::new_for_tests(&test_spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
 	let test_engine = &*test_spec.engine;
@@ -156,7 +155,7 @@ pub fn generate_dummy_client_with_spec_accounts_and_data<F>(test_spec: F, accoun
 			(3141562.into(), 31415620.into()),
 			vec![],
 			false,
-			&mut Vec::new().into_iter(),
+			None,
 		).unwrap();
 		rolling_timestamp += 10;
 		b.set_timestamp(rolling_timestamp);
@@ -263,30 +262,30 @@ pub fn get_test_client_with_blocks(blocks: Vec<Bytes>) -> Arc<Client> {
 	client
 }
 
+struct TestBlockChainDB {
+	_blooms_dir: TempDir,
+	_trace_blooms_dir: TempDir,
+	blooms: blooms_db::Database,
+	trace_blooms: blooms_db::Database,
+	key_value: Arc<KeyValueDB>,
+}
+
+impl BlockChainDB for TestBlockChainDB {
+	fn key_value(&self) -> &Arc<KeyValueDB> {
+		&self.key_value
+	}
+
+	fn blooms(&self) -> &blooms_db::Database {
+		&self.blooms
+	}
+
+	fn trace_blooms(&self) -> &blooms_db::Database {
+		&self.trace_blooms
+	}
+}
+
 /// Creates new test instance of `BlockChainDB`
 pub fn new_db() -> Arc<BlockChainDB> {
-	struct TestBlockChainDB {
-		_blooms_dir: TempDir,
-		_trace_blooms_dir: TempDir,
-		blooms: blooms_db::Database,
-		trace_blooms: blooms_db::Database,
-		key_value: Arc<KeyValueDB>,
-	}
-
-	impl BlockChainDB for TestBlockChainDB {
-		fn key_value(&self) -> &Arc<KeyValueDB> {
-			&self.key_value
-		}
-
-		fn blooms(&self) -> &blooms_db::Database {
-			&self.blooms
-		}
-
-		fn trace_blooms(&self) -> &blooms_db::Database {
-			&self.trace_blooms
-		}
-	}
-
 	let blooms_dir = TempDir::new("").unwrap();
 	let trace_blooms_dir = TempDir::new("").unwrap();
 
@@ -296,6 +295,26 @@ pub fn new_db() -> Arc<BlockChainDB> {
 		_blooms_dir: blooms_dir,
 		_trace_blooms_dir: trace_blooms_dir,
 		key_value: Arc::new(::kvdb_memorydb::create(::db::NUM_COLUMNS.unwrap()))
+	};
+
+	Arc::new(db)
+}
+
+/// Creates a new temporary `BlockChainDB` on FS
+pub fn new_temp_db(tempdir: &Path) -> Arc<BlockChainDB> {
+	let blooms_dir = TempDir::new("").unwrap();
+	let trace_blooms_dir = TempDir::new("").unwrap();
+	let key_value_dir = tempdir.join("key_value");
+
+	let db_config = DatabaseConfig::with_columns(::db::NUM_COLUMNS);
+	let key_value_db = Database::open(&db_config, key_value_dir.to_str().unwrap()).unwrap();
+
+	let db = TestBlockChainDB {
+		blooms: blooms_db::Database::open(blooms_dir.path()).unwrap(),
+		trace_blooms: blooms_db::Database::open(trace_blooms_dir.path()).unwrap(),
+		_blooms_dir: blooms_dir,
+		_trace_blooms_dir: trace_blooms_dir,
+		key_value: Arc::new(key_value_db)
 	};
 
 	Arc::new(db)

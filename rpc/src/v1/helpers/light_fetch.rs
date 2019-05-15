@@ -1,60 +1,68 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Helpers for fetching blockchain data either from the light client or the network.
 
+use std::clone::Clone;
 use std::cmp;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use light::on_demand::error::Error as OnDemandError;
-use ethcore::basic_account::BasicAccount;
-use ethcore::encoded;
-use ethcore::filter::Filter as EthcoreFilter;
-use ethcore::ids::BlockId;
-use ethcore::receipt::Receipt;
+use types::basic_account::BasicAccount;
+use types::encoded;
+use types::filter::Filter as EthcoreFilter;
+use types::ids::BlockId;
+use types::receipt::Receipt;
+use ethcore::executed::ExecutionError;
 
 use jsonrpc_core::{Result, Error};
 use jsonrpc_core::futures::{future, Future};
 use jsonrpc_core::futures::future::Either;
-use jsonrpc_macros::Trailing;
 
 use light::cache::Cache;
 use light::client::LightChainClient;
 use light::{cht, MAX_HEADERS_PER_REQUEST};
 use light::on_demand::{
-	request, OnDemand, HeaderRef, Request as OnDemandRequest,
+	request, OnDemandRequester, HeaderRef, Request as OnDemandRequest,
 	Response as OnDemandResponse, ExecutionResult,
 };
+use light::on_demand::error::Error as OnDemandError;
 use light::request::Field;
+use light::TransactionQueue;
 
-use sync::LightSync;
-use ethereum_types::{U256, Address};
+use sync::{LightNetworkDispatcher, ManageNetwork, LightSyncProvider};
+
+use ethereum_types::{Address, U256};
 use hash::H256;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use fastmap::H256FastMap;
-use transaction::{Action, Transaction as EthTransaction, PendingTransaction, SignedTransaction, LocalizedTransaction};
+use types::transaction::{Action, Transaction as EthTransaction, PendingTransaction, SignedTransaction, LocalizedTransaction};
 
 use v1::helpers::{CallRequest as CallRequestHelper, errors, dispatch};
 use v1::types::{BlockNumber, CallRequest, Log, Transaction};
 
 const NO_INVALID_BACK_REFS_PROOF: &str = "Fails only on invalid back-references; back-references here known to be valid; qed";
-
 const WRONG_RESPONSE_AMOUNT_TYPE_PROOF: &str = "responses correspond directly with requests in amount and type; qed";
+const DEFAULT_GAS_PRICE: u64 = 21_000;
 
-pub fn light_all_transactions(dispatch: &Arc<dispatch::LightDispatcher>) -> impl Iterator<Item=PendingTransaction> {
+pub fn light_all_transactions<S, OD>(dispatch: &Arc<dispatch::LightDispatcher<S, OD>>) -> impl Iterator<Item=PendingTransaction>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	let txq = dispatch.transaction_queue.read();
 	let chain_info = dispatch.client.chain_info();
 
@@ -65,18 +73,37 @@ pub fn light_all_transactions(dispatch: &Arc<dispatch::LightDispatcher>) -> impl
 
 /// Helper for fetching blockchain data either from the light client or the network
 /// as necessary.
-#[derive(Clone)]
-pub struct LightFetch {
+pub struct LightFetch<S, OD>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	/// The light client.
 	pub client: Arc<LightChainClient>,
 	/// The on-demand request service.
-	pub on_demand: Arc<OnDemand>,
+	pub on_demand: Arc<OD>,
 	/// Handle to the network.
-	pub sync: Arc<LightSync>,
+	pub sync: Arc<S>,
 	/// The light data cache.
 	pub cache: Arc<Mutex<Cache>>,
 	/// Gas Price percentile
 	pub gas_price_percentile: usize,
+}
+
+impl<S, OD> Clone for LightFetch<S, OD>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
+	fn clone(&self) -> Self {
+		Self {
+			client: self.client.clone(),
+			on_demand: self.on_demand.clone(),
+			sync: self.sync.clone(),
+			cache: self.cache.clone(),
+			gas_price_percentile: self.gas_price_percentile,
+		}
+	}
 }
 
 /// Extract a transaction at given index.
@@ -99,7 +126,7 @@ pub fn extract_transaction_at_index(block: encoded::Block, index: usize) -> Opti
 				cached_sender,
 			}
 		})
-		.map(|tx| Transaction::from_localized(tx))
+		.map(Transaction::from_localized)
 }
 
 // extract the header indicated by the given `HeaderRef` from the given responses.
@@ -114,7 +141,11 @@ fn extract_header(res: &[OnDemandResponse], header: HeaderRef) -> Option<encoded
 	}
 }
 
-impl LightFetch {
+impl<S, OD> LightFetch<S, OD>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	// push the necessary requests onto the request chain to get the header by the given ID.
 	// yield a header reference which other requests can use.
 	fn make_header_requests(&self, id: BlockId, reqs: &mut Vec<OnDemandRequest>) -> Result<HeaderRef> {
@@ -134,7 +165,7 @@ impl LightFetch {
 						let idx = reqs.len();
 						let hash_ref = Field::back_ref(idx, 0);
 						reqs.push(req.into());
-						reqs.push(request::HeaderByHash(hash_ref.clone()).into());
+						reqs.push(request::HeaderByHash(hash_ref).into());
 
 						Ok(HeaderRef::Unresolved(idx + 1, hash_ref))
 					}
@@ -172,7 +203,7 @@ impl LightFetch {
 			Err(e) => return Either::A(future::err(e)),
 		};
 
-		reqs.push(request::Account { header: header_ref.clone(), address: address }.into());
+		reqs.push(request::Account { header: header_ref.clone(), address }.into());
 		let account_idx = reqs.len() - 1;
 		reqs.push(request::Code { header: header_ref, code_hash: Field::back_ref(account_idx, 0) }.into());
 
@@ -184,26 +215,43 @@ impl LightFetch {
 
 	/// Helper for getting account info at a given block.
 	/// `None` indicates the account doesn't exist at the given block.
-	pub fn account(&self, address: Address, id: BlockId) -> impl Future<Item = Option<BasicAccount>, Error = Error> + Send {
+	pub fn account(
+		&self,
+		address: Address,
+		id: BlockId,
+		tx_queue: Arc<RwLock<TransactionQueue>>
+	) -> impl Future<Item = Option<BasicAccount>, Error = Error> + Send {
+
 		let mut reqs = Vec::new();
 		let header_ref = match self.make_header_requests(id, &mut reqs) {
 			Ok(r) => r,
 			Err(e) => return Either::A(future::err(e)),
 		};
 
-		reqs.push(request::Account { header: header_ref, address: address }.into());
+		reqs.push(request::Account { header: header_ref, address }.into());
 
-		Either::B(self.send_requests(reqs, |mut res|match res.pop() {
-			Some(OnDemandResponse::Account(acc)) => acc,
+		Either::B(self.send_requests(reqs, move |mut res| match res.pop() {
+			Some(OnDemandResponse::Account(maybe_account)) => {
+				if let Some(ref acc) = maybe_account {
+					let mut txq = tx_queue.write();
+					txq.cull(address, acc.nonce);
+				}
+				maybe_account
+			}
 			_ => panic!(WRONG_RESPONSE_AMOUNT_TYPE_PROOF),
 		}))
 	}
 
 	/// Helper for getting proved execution.
-	pub fn proved_read_only_execution(&self, req: CallRequest, num: Trailing<BlockNumber>) -> impl Future<Item = ExecutionResult, Error = Error> + Send {
-		const DEFAULT_GAS_PRICE: u64 = 21_000;
-		// starting gas when gas not provided.
-		const START_GAS: u64 = 50_000;
+	pub fn proved_read_only_execution(
+		&self,
+		req: CallRequest,
+		num: Option<BlockNumber>,
+		txq: Arc<RwLock<TransactionQueue>>
+	) -> impl Future<Item = ExecutionResult, Error = Error> + Send {
+
+		// (21000 G_transaction + 32000 G_create + some marginal to allow a few operations)
+		const START_GAS: u64 = 60_000;
 
 		let (sync, on_demand, client) = (self.sync.clone(), self.on_demand.clone(), self.client.clone());
 		let req: CallRequestHelper = req.into();
@@ -221,24 +269,15 @@ impl LightFetch {
 			}
 		};
 
-		let from = req.from.unwrap_or_else(|| Address::zero());
+		let from = req.from.unwrap_or_default();
 		let nonce_fut = match req.nonce {
 			Some(nonce) => Either::A(future::ok(Some(nonce))),
-			None => Either::B(self.account(from, id).map(|acc| acc.map(|a| a.nonce))),
+			None => Either::B(self.account(from, id, txq).map(|acc| acc.map(|a| a.nonce))),
 		};
 
-		let gas_price_percentile = self.gas_price_percentile;
 		let gas_price_fut = match req.gas_price {
 			Some(price) => Either::A(future::ok(price)),
-			None => Either::B(dispatch::fetch_gas_price_corpus(
-				self.sync.clone(),
-				self.client.clone(),
-				self.on_demand.clone(),
-				self.cache.clone(),
-			).map(move |corp| match corp.percentile(gas_price_percentile) {
-				Some(percentile) => *percentile,
-				None => DEFAULT_GAS_PRICE.into(),
-			}))
+			None => Either::B(self.gas_price()),
 		};
 
 		// if nonce resolves, this should too since it'll be in the LRU-cache.
@@ -252,7 +291,7 @@ impl LightFetch {
 					action: req.to.map_or(Action::Create, Action::Call),
 					gas: req.gas.unwrap_or_else(|| START_GAS.into()),
 					gas_price,
-					value: req.value.unwrap_or_else(U256::zero),
+					value: req.value.unwrap_or_default(),
 					data: req.data.unwrap_or_default(),
 				}))
 			)
@@ -275,6 +314,23 @@ impl LightFetch {
 				sync,
 			}))
 		}))
+	}
+
+	/// Helper to fetch the corpus gas price from 1) the cache 2) the network then it tries to estimate the percentile
+	/// using `gas_price_percentile` if the estimated percentile is zero the `DEFAULT_GAS_PRICE` is returned
+	pub fn gas_price(&self) -> impl Future<Item = U256, Error = Error> + Send {
+		let gas_price_percentile = self.gas_price_percentile;
+
+		dispatch::light::fetch_gas_price_corpus(
+			self.sync.clone(),
+			self.client.clone(),
+			self.on_demand.clone(),
+			self.cache.clone(),
+		)
+		.map(move |corp| {
+			corp.percentile(gas_price_percentile)
+				.map_or_else(|| DEFAULT_GAS_PRICE.into(), |percentile| *percentile)
+		})
 	}
 
 	/// Get a block itself. Fails on unknown block ID.
@@ -309,9 +365,7 @@ impl LightFetch {
 		}))
 	}
 
-	/// Get transaction logs
-	pub fn logs(&self, filter: EthcoreFilter) -> impl Future<Item = Vec<Log>, Error = Error> + Send {
-		use std::collections::BTreeMap;
+	pub fn logs_no_tx_hash(&self, filter: EthcoreFilter) -> impl Future<Item = Vec<Log>, Error = Error> + Send {
 		use jsonrpc_core::futures::stream::{self, Stream};
 
 		const MAX_BLOCK_RANGE: u64 = 1000;
@@ -342,15 +396,15 @@ impl LightFetch {
 					// insert them into a BTreeMap to maintain order by number and block index.
 					stream::futures_unordered(receipts_futures)
 						.fold(BTreeMap::new(), move |mut matches, (num, hash, receipts)| {
-							let mut block_index = 0;
+							let mut block_index: usize = 0;
 							for (transaction_index, receipt) in receipts.into_iter().enumerate() {
 								for (transaction_log_index, log) in receipt.logs.into_iter().enumerate() {
 									if filter.matches(&log) {
 										matches.insert((num, block_index), Log {
-											address: log.address.into(),
+											address: log.address,
 											topics: log.topics.into_iter().map(Into::into).collect(),
 											data: log.data.into(),
-											block_hash: Some(hash.into()),
+											block_hash: Some(hash),
 											block_number: Some(num.into()),
 											// No way to easily retrieve transaction hash, so let's just skip it.
 											transaction_hash: None,
@@ -364,16 +418,48 @@ impl LightFetch {
 									block_index += 1;
 								}
 							}
-							future::ok::<_,OnDemandError>(matches)
-						}) // and then collect them into a vector.
-						.map(|matches| matches.into_iter().map(|(_, v)| v).collect())
+							future::ok::<_, OnDemandError>(matches)
+						})
 						.map_err(errors::on_demand_error)
+						.map(|matches| matches.into_iter().map(|(_, v)| v).collect())
 				});
 
 				match maybe_future {
 					Some(fut) => Either::B(Either::A(fut)),
 					None => Either::B(Either::B(future::err(errors::network_disabled()))),
 				}
+			})
+	}
+
+	/// Get transaction logs
+	pub fn logs(&self, filter: EthcoreFilter) -> impl Future<Item = Vec<Log>, Error = Error> + Send {
+		use jsonrpc_core::futures::stream::{self, Stream};
+		let fetcher_block = self.clone();
+		self.logs_no_tx_hash(filter)
+			// retrieve transaction hash.
+			.and_then(move |mut result| {
+				let mut blocks = BTreeMap::new();
+				for log in result.iter() {
+						let block_hash = log.block_hash.as_ref().expect("Previously initialized with value; qed");
+						blocks.entry(*block_hash).or_insert_with(|| {
+							fetcher_block.block(BlockId::Hash(*block_hash))
+						});
+				}
+				// future get blocks (unordered it)
+				stream::futures_unordered(blocks.into_iter().map(|(_, v)| v)).collect().map(move |blocks| {
+					let transactions_per_block: BTreeMap<_, _> = blocks.iter()
+						.map(|block| (block.hash(), block.transactions())).collect();
+					for log in result.iter_mut() {
+						let log_index = log.transaction_index.expect("Previously initialized with value; qed");
+						let block_hash = log.block_hash.expect("Previously initialized with value; qed");
+						let tx_hash = transactions_per_block.get(&block_hash)
+							// transaction index is from an enumerate call in log common so not need to check value
+							.and_then(|txs| txs.get(log_index.as_usize()))
+							.map(types::transaction::UnverifiedTransaction::hash);
+						log.transaction_hash = tx_hash;
+					}
+					result
+				})
 			})
 	}
 
@@ -387,7 +473,7 @@ impl LightFetch {
 
 		Box::new(future::loop_fn(params, move |(sync, on_demand)| {
 			let maybe_future = sync.with_context(|ctx| {
-				let req = request::TransactionIndex(tx_hash.clone().into());
+				let req = request::TransactionIndex(tx_hash.into());
 				on_demand.request(ctx, req)
 			});
 
@@ -413,7 +499,7 @@ impl LightFetch {
 						let index = index.index as usize;
 						let transaction = extract_transaction_at_index(blk, index);
 
-						if transaction.as_ref().map_or(true, |tx| tx.hash != tx_hash.into()) {
+						if transaction.as_ref().map_or(true, |tx| tx.hash != tx_hash) {
 							// index is actively wrong: indicated block has
 							// fewer transactions than necessary or the transaction
 							// at that index had a different hash.
@@ -434,6 +520,46 @@ impl LightFetch {
 
 			Either::B(extract_transaction)
 		}))
+	}
+
+	/// Helper to cull the `light` transaction queue of mined transactions
+	pub fn light_cull(&self, txq: Arc<RwLock<TransactionQueue>>) -> impl Future <Item = (), Error = Error> + Send {
+		let senders = txq.read().queued_senders();
+		if senders.is_empty() {
+			return Either::B(future::err(errors::internal("No pending local transactions", "")));
+		}
+
+		let sync = self.sync.clone();
+		let on_demand = self.on_demand.clone();
+		let best_header = self.client.best_block_header();
+		let start_nonce = self.client.engine().account_start_nonce(best_header.number());
+
+		let account_request = sync.with_context(move |ctx| {
+			// fetch the nonce of each sender in the queue.
+			let nonce_reqs = senders.iter()
+				.map(|&address| request::Account { header: best_header.clone().into(), address })
+				.collect::<Vec<_>>();
+
+			// when they come in, update each sender to the new nonce.
+			on_demand.request(ctx, nonce_reqs)
+				.expect(NO_INVALID_BACK_REFS_PROOF)
+				.map(move |accs| {
+					let mut txq = txq.write();
+					accs.into_iter()
+						.map(|maybe_acc| maybe_acc.map_or(start_nonce, |acc| acc.nonce))
+						.zip(senders)
+						.for_each(|(nonce, addr)| {
+							txq.cull(addr, nonce);
+						});
+				})
+				.map_err(errors::on_demand_error)
+		});
+
+		if let Some(fut) = account_request {
+			Either::A(fut)
+		} else {
+			Either::B(future::err(errors::network_disabled()))
+		}
 	}
 
 	fn send_requests<T, F>(&self, reqs: Vec<OnDemandRequest>, parse_response: F) -> impl Future<Item = T, Error = Error> + Send where
@@ -467,7 +593,7 @@ impl LightFetch {
 	) -> impl Future<Item = Vec<encoded::Header>, Error = Error> {
 		let fetch_hashes = [from_block, to_block].iter()
 			.filter_map(|block_id| match block_id {
-				BlockId::Hash(hash) => Some(hash.clone()),
+				BlockId::Hash(hash) => Some(*hash),
 				_ => None,
 			})
 			.collect::<Vec<_>>();
@@ -478,14 +604,14 @@ impl LightFetch {
 		self.headers_by_hash(&fetch_hashes[..]).and_then(move |mut header_map| {
 			let (from_block_num, to_block_num) = {
 				let block_number = |id| match id {
-					&BlockId::Earliest => 0,
-					&BlockId::Latest => best_number,
-					&BlockId::Hash(ref h) =>
-						header_map.get(h).map(|hdr| hdr.number())
+					BlockId::Earliest => 0,
+					BlockId::Latest => best_number,
+					BlockId::Hash(ref h) =>
+						header_map.get(h).map(types::encoded::Header::number)
 						.expect("from_block and to_block headers are fetched by hash; this closure is only called on from_block and to_block; qed"),
-					&BlockId::Number(x) => x,
+					BlockId::Number(x) => x,
 				};
-				(block_number(&from_block), block_number(&to_block))
+				(block_number(from_block), block_number(to_block))
 			};
 
 			if to_block_num < from_block_num {
@@ -502,7 +628,7 @@ impl LightFetch {
 			let headers_fut = fetcher.headers_range(from_block_num, to_block_num, to_header_hint);
 			Either::B(headers_fut.map(move |headers| {
 				// Validate from_block if it's a hash
-				let last_hash = headers.last().map(|hdr| hdr.hash());
+				let last_hash = headers.last().map(types::encoded::Header::hash);
 				match (last_hash, from_block) {
 					(Some(h1), BlockId::Hash(h2)) if h1 != h2 => Vec::new(),
 					_ => headers,
@@ -523,15 +649,13 @@ impl LightFetch {
 		}
 
 		self.send_requests(reqs, move |res| {
-			let headers = refs.drain()
-				.map(|(hash, header_ref)| {
+			refs.into_iter().map(|(hash, header_ref)| {
 					let hdr = extract_header(&res, header_ref)
 						.expect("these responses correspond to requests that header_ref belongs to; \
 								qed");
 					(hash, hdr)
-				})
-				.collect();
-			headers
+			})
+			.collect()
 		})
 	}
 
@@ -604,39 +728,77 @@ impl LightFetch {
 	}
 }
 
-#[derive(Clone)]
-struct ExecuteParams {
+struct ExecuteParams<S, OD>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	from: Address,
 	tx: EthTransaction,
 	hdr: encoded::Header,
 	env_info: ::vm::EnvInfo,
 	engine: Arc<::ethcore::engines::EthEngine>,
-	on_demand: Arc<OnDemand>,
-	sync: Arc<LightSync>,
+	on_demand: Arc<OD>,
+	sync: Arc<S>,
 }
 
-// has a peer execute the transaction with given params. If `gas_known` is false,
-// this will double the gas on each `OutOfGas` error.
-fn execute_read_only_tx(gas_known: bool, params: ExecuteParams) -> impl Future<Item = ExecutionResult, Error = Error> + Send {
+impl<S, OD> Clone for ExecuteParams<S, OD>
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
+	fn clone(&self) -> Self {
+		Self {
+			from: self.from,
+			tx: self.tx.clone(),
+			hdr: self.hdr.clone(),
+			env_info: self.env_info.clone(),
+			engine: self.engine.clone(),
+			on_demand: self.on_demand.clone(),
+			sync: self.sync.clone()
+		}
+	}
+}
+
+// Has a peer execute the transaction with given params. If `gas_known` is false, this will set the `gas value` to the
+// `required gas value` unless it exceeds the block gas limit
+fn execute_read_only_tx<S, OD>(gas_known: bool, params: ExecuteParams<S, OD>) -> impl Future<Item = ExecutionResult, Error = Error> + Send
+where
+	S: LightSyncProvider + LightNetworkDispatcher + ManageNetwork + 'static,
+	OD: OnDemandRequester + 'static
+{
 	if !gas_known {
 		Box::new(future::loop_fn(params, |mut params| {
 			execute_read_only_tx(true, params.clone()).and_then(move |res| {
 				match res {
 					Ok(executed) => {
-						// TODO: how to distinguish between actual OOG and
-						// exception?
-						if executed.exception.is_some() {
-							let old_gas = params.tx.gas;
-							params.tx.gas = params.tx.gas * 2u32;
-							if params.tx.gas > params.hdr.gas_limit() {
-								params.tx.gas = old_gas;
+						// `OutOfGas` exception, try double the gas
+						if let Some(::vm::Error::OutOfGas) = executed.exception {
+							// block gas limit already tried, regard as an error and don't retry
+							if params.tx.gas >= params.hdr.gas_limit() {
+								trace!(target: "light_fetch", "OutOutGas exception received, gas increase: failed");
 							} else {
+								params.tx.gas = cmp::min(params.tx.gas * 2_u32, params.hdr.gas_limit());
+								trace!(target: "light_fetch", "OutOutGas exception received, gas increased to {}",
+									   params.tx.gas);
 								return Ok(future::Loop::Continue(params))
 							}
 						}
-
 						Ok(future::Loop::Break(Ok(executed)))
 					}
+					Err(ExecutionError::NotEnoughBaseGas { required, got }) => {
+						trace!(target: "light_fetch", "Not enough start gas provided required: {}, got: {}",
+							   required, got);
+						if required <= params.hdr.gas_limit() {
+							params.tx.gas = required;
+							Ok(future::Loop::Continue(params))
+						} else {
+							warn!(target: "light_fetch",
+								  "Required gas is bigger than block header's gas dropping the request");
+							Ok(future::Loop::Break(Err(ExecutionError::NotEnoughBaseGas { required, got })))
+						}
+					}
+					// Non-recoverable execution error
 					failed => Ok(future::Loop::Break(failed)),
 				}
 			})

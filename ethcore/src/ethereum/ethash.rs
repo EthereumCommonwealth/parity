@@ -1,34 +1,37 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::path::Path;
 use std::cmp;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
-use hash::{KECCAK_EMPTY_LIST_RLP};
-use engines::block_reward::{self, BlockRewardContract, RewardKind};
-use ethash::{self, quick_get_difficulty, slow_hash_block_number, EthashManager, OptimizeFor};
+
 use ethereum_types::{H256, H64, U256};
-use unexpected::{OutOfBounds, Mismatch};
-use block::*;
-use error::{BlockError, Error};
-use header::{Header, BlockNumber, ExtendedHeader};
-use engines::{self, Engine};
 use ethjson;
+use hash::{KECCAK_EMPTY_LIST_RLP};
 use rlp::Rlp;
+use types::header::{Header, ExtendedHeader};
+use types::BlockNumber;
+use unexpected::{OutOfBounds, Mismatch};
+
+use block::ExecutedBlock;
+use engines::block_reward::{self, BlockRewardContract, RewardKind};
+use engines::{self, Engine};
+use error::{BlockError, Error};
+use ethash::{self, quick_get_difficulty, slow_hash_block_number, EthashManager, OptimizeFor};
 use machine::EthereumMachine;
 
 /// Number of blocks in an ethash snapshot.
@@ -110,6 +113,8 @@ pub struct EthashParams {
 	pub block_reward_contract: Option<BlockRewardContract>,
 	/// Difficulty bomb delays.
 	pub difficulty_bomb_delays: BTreeMap<BlockNumber, BlockNumber>,
+	/// Block to transition to progpow
+	pub progpow_transition: u64,
 }
 
 impl From<ethjson::spec::EthashParams> for EthashParams {
@@ -150,6 +155,7 @@ impl From<ethjson::spec::EthashParams> for EthashParams {
 				}),
 			expip2_transition: p.expip2_transition.map_or(u64::max_value(), Into::into),
 			expip2_duration_limit: p.expip2_duration_limit.map_or(30, Into::into),
+			progpow_transition: p.progpow_transition.map_or(u64::max_value(), Into::into),
 			block_reward_contract_transition: p.block_reward_contract_transition.map_or(0, Into::into),
 			block_reward_contract: match (p.block_reward_contract_code, p.block_reward_contract_address) {
 				(Some(code), _) => Some(BlockRewardContract::new_from_code(Arc::new(code.into()))),
@@ -179,10 +185,12 @@ impl Ethash {
 		machine: EthereumMachine,
 		optimize_for: T,
 	) -> Arc<Self> {
+		let progpow_transition = ethash_params.progpow_transition;
+
 		Arc::new(Ethash {
 			ethash_params,
 			machine,
-			pow: EthashManager::new(cache_dir.as_ref(), optimize_for.into()),
+			pow: EthashManager::new(cache_dir.as_ref(), optimize_for.into(), progpow_transition),
 		})
 	}
 }
@@ -233,17 +241,16 @@ impl Engine<EthereumMachine> for Arc<Ethash> {
 	/// This assumes that all uncles are valid uncles (i.e. of at least one generation before the current).
 	fn on_close_block(&self, block: &mut ExecutedBlock) -> Result<(), Error> {
 		use std::ops::Shr;
-		use parity_machine::LiveBlock;
 
-		let author = *LiveBlock::header(&*block).author();
-		let number = LiveBlock::header(&*block).number();
+		let author = *block.header.author();
+		let number = block.header.number();
 
 		let rewards = match self.ethash_params.block_reward_contract {
 			Some(ref c) if number >= self.ethash_params.block_reward_contract_transition => {
 				let mut beneficiaries = Vec::new();
 
 				beneficiaries.push((author, RewardKind::Author));
-				for u in LiveBlock::uncles(&*block) {
+				for u in &block.uncles {
 					let uncle_author = u.author();
 					beneficiaries.push((*uncle_author, RewardKind::uncle(number, u.number())));
 				}
@@ -266,15 +273,16 @@ impl Engine<EthereumMachine> for Arc<Ethash> {
 				let eras_rounds = self.ethash_params.ecip1017_era_rounds;
 				let (eras, reward) = ecip1017_eras_block_reward(eras_rounds, reward, number);
 
-				let n_uncles = LiveBlock::uncles(&*block).len();
+				//let n_uncles = LiveBlock::uncles(&*block).len();
+				let n_uncles = block.uncles.len();
 
 				// Bestow block rewards.
-				let mut result_block_reward = reward + reward.shr(5) * U256::from(n_uncles);
+				let result_block_reward = reward + reward.shr(5) * U256::from(n_uncles);
 
 				rewards.push((author, RewardKind::Author, result_block_reward));
 
 				// Bestow uncle rewards.
-				for u in LiveBlock::uncles(&*block) {
+				for u in &block.uncles {
 					let uncle_author = u.author();
 					let result_uncle_reward = if eras == 0 {
 						(reward * U256::from(8 + u.number() - number)).shr(3)
@@ -317,7 +325,8 @@ impl Engine<EthereumMachine> for Arc<Ethash> {
 		let difficulty = ethash::boundary_to_difficulty(&H256(quick_get_difficulty(
 			&header.bare_hash().0,
 			seal.nonce.low_u64(),
-			&seal.mix_hash.0
+			&seal.mix_hash.0,
+			header.number() >= self.ethash_params.progpow_transition
 		)));
 
 		if &difficulty < header.difficulty() {
@@ -481,8 +490,8 @@ mod tests {
 	use ethereum_types::{H64, H256, U256, Address};
 	use block::*;
 	use test_helpers::get_temp_state_db;
-	use error::{BlockError, Error, ErrorKind};
-	use header::Header;
+	use error::{BlockError, Error};
+	use types::header::Header;
 	use spec::Spec;
 	use engines::Engine;
 	use super::super::{new_morden, new_mcip3_test, new_homestead_test_machine};
@@ -520,6 +529,7 @@ mod tests {
 			block_reward_contract: None,
 			block_reward_contract_transition: 0,
 			difficulty_bomb_delays: BTreeMap::new(),
+			progpow_transition: u64::max_value(),
 		}
 	}
 
@@ -530,9 +540,9 @@ mod tests {
 		let genesis_header = spec.genesis_header();
 		let db = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
-		let b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, Address::zero(), (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
+		let b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, Address::zero(), (3141562.into(), 31415620.into()), vec![], false, None).unwrap();
 		let b = b.close().unwrap();
-		assert_eq!(b.state().balance(&Address::zero()).unwrap(), U256::from_str("4563918244f40000").unwrap());
+		assert_eq!(b.state.balance(&Address::zero()).unwrap(), U256::from_str("4563918244f40000").unwrap());
 	}
 
 	#[test]
@@ -579,15 +589,15 @@ mod tests {
 		let genesis_header = spec.genesis_header();
 		let db = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
-		let mut b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, Address::zero(), (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
+		let mut b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, Address::zero(), (3141562.into(), 31415620.into()), vec![], false, None).unwrap();
 		let mut uncle = Header::new();
 		let uncle_author: Address = "ef2d6d194084c2de36e0dabfce45d046b37d1106".into();
 		uncle.set_author(uncle_author);
 		b.push_uncle(uncle).unwrap();
 
 		let b = b.close().unwrap();
-		assert_eq!(b.state().balance(&Address::zero()).unwrap(), "478eae0e571ba000".into());
-		assert_eq!(b.state().balance(&uncle_author).unwrap(), "3cb71f51fc558000".into());
+		assert_eq!(b.state.balance(&Address::zero()).unwrap(), "478eae0e571ba000".into());
+		assert_eq!(b.state.balance(&uncle_author).unwrap(), "3cb71f51fc558000".into());
 	}
 
 	#[test]
@@ -597,14 +607,14 @@ mod tests {
 		let genesis_header = spec.genesis_header();
 		let db = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
-		let b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, Address::zero(), (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
+		let b = OpenBlock::new(engine, Default::default(), false, db, &genesis_header, last_hashes, Address::zero(), (3141562.into(), 31415620.into()), vec![], false, None).unwrap();
 		let b = b.close().unwrap();
 
 		let ubi_contract: Address = "00efdd5883ec628983e9063c7d969fe268bbf310".into();
 		let dev_contract: Address = "00756cf8159095948496617f5fb17ed95059f536".into();
-		assert_eq!(b.state().balance(&Address::zero()).unwrap(), U256::from_str("d8d726b7177a80000").unwrap());
-		assert_eq!(b.state().balance(&ubi_contract).unwrap(), U256::from_str("2b5e3af16b1880000").unwrap());
-		assert_eq!(b.state().balance(&dev_contract).unwrap(), U256::from_str("c249fdd327780000").unwrap());
+		assert_eq!(b.state.balance(&Address::zero()).unwrap(), U256::from_str("d8d726b7177a80000").unwrap());
+		assert_eq!(b.state.balance(&ubi_contract).unwrap(), U256::from_str("2b5e3af16b1880000").unwrap());
+		assert_eq!(b.state.balance(&dev_contract).unwrap(), U256::from_str("c249fdd327780000").unwrap());
 	}
 
 	#[test]
@@ -631,7 +641,7 @@ mod tests {
 		let verify_result = engine.verify_block_basic(&header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::InvalidSealArity(_)), _)) => {},
+			Err(Error::Block(BlockError::InvalidSealArity(_))) => {},
 			Err(_) => { panic!("should be block seal-arity mismatch error (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -646,7 +656,7 @@ mod tests {
 		let verify_result = engine.verify_block_basic(&header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::DifficultyOutOfBounds(_)), _)) => {},
+			Err(Error::Block(BlockError::DifficultyOutOfBounds(_))) => {},
 			Err(_) => { panic!("should be block difficulty error (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -662,7 +672,7 @@ mod tests {
 		let verify_result = engine.verify_block_basic(&header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::InvalidProofOfWork(_)), _)) => {},
+			Err(Error::Block(BlockError::InvalidProofOfWork(_))) => {},
 			Err(_) => { panic!("should be invalid proof of work error (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -676,7 +686,7 @@ mod tests {
 		let verify_result = engine.verify_block_unordered(&header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::InvalidSealArity(_)), _)) => {},
+			Err(Error::Block(BlockError::InvalidSealArity(_))) => {},
 			Err(_) => { panic!("should be block seal-arity mismatch error (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -701,7 +711,7 @@ mod tests {
 		let verify_result = engine.verify_block_unordered(&header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::MismatchedH256SealElement(_)), _)) => {},
+			Err(Error::Block(BlockError::MismatchedH256SealElement(_))) => {},
 			Err(_) => { panic!("should be invalid 256-bit seal fail (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -717,7 +727,7 @@ mod tests {
 		let verify_result = engine.verify_block_unordered(&header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::InvalidProofOfWork(_)), _)) => {},
+			Err(Error::Block(BlockError::InvalidProofOfWork(_))) => {},
 			Err(_) => { panic!("should be invalid proof-of-work fail (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -732,7 +742,7 @@ mod tests {
 		let verify_result = engine.verify_block_family(&header, &parent_header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::RidiculousNumber(_)), _)) => {},
+			Err(Error::Block(BlockError::RidiculousNumber(_))) => {},
 			Err(_) => { panic!("should be invalid block number fail (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}
@@ -749,7 +759,7 @@ mod tests {
 		let verify_result = engine.verify_block_family(&header, &parent_header);
 
 		match verify_result {
-			Err(Error(ErrorKind::Block(BlockError::InvalidDifficulty(_)), _)) => {},
+			Err(Error::Block(BlockError::InvalidDifficulty(_))) => {},
 			Err(_) => { panic!("should be invalid difficulty fail (got {:?})", verify_result); },
 			_ => { panic!("Should be error, got Ok"); },
 		}

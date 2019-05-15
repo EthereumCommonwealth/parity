@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Transaction Scoring and Ordering
 //!
@@ -122,28 +122,6 @@ impl<P> txpool::Scoring<P> for NonceAndGasPrice where P: ScoredTransaction + txp
 		}
 	}
 
-	fn should_replace(&self, old: &P, new: &P) -> scoring::Choice {
-		if old.sender() == new.sender() {
-			// prefer earliest transaction
-			match new.nonce().cmp(&old.nonce()) {
-				cmp::Ordering::Less => scoring::Choice::ReplaceOld,
-				cmp::Ordering::Greater => scoring::Choice::RejectNew,
-				cmp::Ordering::Equal => self.choose(old, new),
-			}
-		} else if old.priority().is_local() && new.priority().is_local() {
-			// accept local transactions over the limit
-			scoring::Choice::InsertNew
-		} else {
-			let old_score = (old.priority(), old.gas_price());
-			let new_score = (new.priority(), new.gas_price());
-			if new_score > old_score {
-				scoring::Choice::ReplaceOld
-			} else {
-				scoring::Choice::RejectNew
-			}
-	 	}
-	}
-
 	fn should_ignore_sender_limit(&self, new: &P) -> bool {
 		new.priority().is_local()
 	}
@@ -154,101 +132,8 @@ mod tests {
 	use super::*;
 
 	use std::sync::Arc;
-	use ethkey::{Random, Generator};
 	use pool::tests::tx::{Tx, TxExt};
 	use txpool::Scoring;
-	use txpool::scoring::Choice::*;
-
-	#[test]
-	fn should_replace_same_sender_by_nonce() {
-		let scoring = NonceAndGasPrice(PrioritizationStrategy::GasPriceOnly);
-
-		let tx1 = Tx {
-			nonce: 1,
-			gas_price: 1,
-			..Default::default()
-		};
-		let tx2 = Tx {
-			nonce: 2,
-			gas_price: 100,
-			..Default::default()
-		};
-		let tx3 = Tx {
-			nonce: 2,
-			gas_price: 110,
-			..Default::default()
-		};
-		let tx4 = Tx {
-			nonce: 2,
-			gas_price: 130,
-			..Default::default()
-		};
-
-		let keypair = Random.generate().unwrap();
-		let txs = vec![tx1, tx2, tx3, tx4].into_iter().map(|tx| {
-			tx.unsigned().sign(keypair.secret(), None).verified()
-		}).collect::<Vec<_>>();
-
-		assert_eq!(scoring.should_replace(&txs[0], &txs[1]), RejectNew);
-		assert_eq!(scoring.should_replace(&txs[1], &txs[0]), ReplaceOld);
-
-		assert_eq!(scoring.should_replace(&txs[1], &txs[2]), RejectNew);
-		assert_eq!(scoring.should_replace(&txs[2], &txs[1]), RejectNew);
-
-		assert_eq!(scoring.should_replace(&txs[1], &txs[3]), ReplaceOld);
-		assert_eq!(scoring.should_replace(&txs[3], &txs[1]), RejectNew);
-	}
-
-	#[test]
-	fn should_replace_different_sender_by_priority_and_gas_price() {
-		// given
-		let scoring = NonceAndGasPrice(PrioritizationStrategy::GasPriceOnly);
-		let tx_regular_low_gas = {
-			let tx = Tx {
-				nonce: 1,
-				gas_price: 1,
-				..Default::default()
-			};
-			tx.signed().verified()
-		};
-		let tx_regular_high_gas = {
-			let tx = Tx {
-				nonce: 2,
-				gas_price: 10,
-				..Default::default()
-			};
-			tx.signed().verified()
-		};
-		let tx_local_low_gas = {
-			let tx = Tx {
-				nonce: 2,
-				gas_price: 1,
-				..Default::default()
-			};
-			let mut verified_tx = tx.signed().verified();
-			verified_tx.priority = ::pool::Priority::Local;
-			verified_tx
-		};
-		let tx_local_high_gas = {
-			let tx = Tx {
-				nonce: 1,
-				gas_price: 10,
-				..Default::default()
-			};
-			let mut verified_tx = tx.signed().verified();
-			verified_tx.priority = ::pool::Priority::Local;
-			verified_tx
-		};
-
-		assert_eq!(scoring.should_replace(&tx_regular_low_gas, &tx_regular_high_gas), ReplaceOld);
-		assert_eq!(scoring.should_replace(&tx_regular_high_gas, &tx_regular_low_gas), RejectNew);
-
-		assert_eq!(scoring.should_replace(&tx_regular_high_gas, &tx_local_low_gas), ReplaceOld);
-		assert_eq!(scoring.should_replace(&tx_local_low_gas, &tx_regular_high_gas), RejectNew);
-
-		assert_eq!(scoring.should_replace(&tx_local_low_gas, &tx_local_high_gas), InsertNew);
-		assert_eq!(scoring.should_replace(&tx_local_high_gas, &tx_regular_low_gas), RejectNew);
-	}
 
 	#[test]
 	fn should_calculate_score_correctly() {

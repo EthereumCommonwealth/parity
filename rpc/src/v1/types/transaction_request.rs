@@ -1,22 +1,23 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! `TransactionRequest` type
 
-use v1::types::{Bytes, H160, U256, TransactionCondition};
+use ethereum_types::{H160, U256};
+use v1::types::{Bytes, TransactionCondition};
 use v1::helpers;
 use ansi_term::Colour;
 
@@ -57,13 +58,12 @@ pub fn format_ether(i: U256) -> String {
 	} else {
 		string.insert(idx as usize, '.');
 	}
-	String::from(string.trim_right_matches('0')
-		.trim_right_matches('.'))
+	String::from(string.trim_end_matches('0').trim_end_matches('.'))
 }
 
 impl fmt::Display for TransactionRequest {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		let eth = self.value.unwrap_or(U256::from(0));
+		let eth = self.value.unwrap_or_default();
 		match self.to {
 			Some(ref to) => write!(
 				f,
@@ -106,14 +106,14 @@ impl From<helpers::TransactionRequest> for TransactionRequest {
 impl From<helpers::FilledTransactionRequest> for TransactionRequest {
 	fn from(r: helpers::FilledTransactionRequest) -> Self {
 		TransactionRequest {
-			from: Some(r.from.into()),
-			to: r.to.map(Into::into),
-			gas_price: Some(r.gas_price.into()),
-			gas: Some(r.gas.into()),
-			value: Some(r.value.into()),
+			from: Some(r.from),
+			to: r.to,
+			gas_price: Some(r.gas_price),
+			gas: Some(r.gas),
+			value: Some(r.value),
 			data: Some(r.data.into()),
-			nonce: r.nonce.map(Into::into),
-			condition: r.condition.map(Into::into),
+			nonce: r.nonce,
+			condition: r.condition,
 		}
 	}
 }
@@ -138,7 +138,8 @@ mod tests {
 	use std::str::FromStr;
 	use rustc_hex::FromHex;
 	use serde_json;
-	use v1::types::{U256, H160, TransactionCondition};
+	use v1::types::TransactionCondition;
+	use ethereum_types::{H160, U256};
 	use super::*;
 
 	#[test]

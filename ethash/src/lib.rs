@@ -1,20 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
-
-#![cfg_attr(feature = "benches", feature(test))]
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 extern crate either;
 extern crate ethereum_types;
@@ -28,13 +26,28 @@ extern crate crunchy;
 extern crate log;
 
 #[cfg(test)]
+extern crate rustc_hex;
+
+#[cfg(test)]
+extern crate serde_json;
+
+#[cfg(test)]
 extern crate tempdir;
 
+#[cfg(feature = "bench")]
+pub mod compute;
+#[cfg(not(feature = "bench"))]
 mod compute;
+
 mod seed_compute;
 mod cache;
 mod keccak;
 mod shared;
+
+#[cfg(feature = "bench")]
+pub mod progpow;
+#[cfg(not(feature = "bench"))]
+mod progpow;
 
 pub use cache::{NodeCacheBuilder, OptimizeFor};
 pub use compute::{ProofOfWork, quick_get_difficulty, slow_hash_block_number};
@@ -61,14 +74,16 @@ pub struct EthashManager {
 	nodecache_builder: NodeCacheBuilder,
 	cache: Mutex<LightCache>,
 	cache_dir: PathBuf,
+	progpow_transition: u64,
 }
 
 impl EthashManager {
 	/// Create a new new instance of ethash manager
-	pub fn new<T: Into<Option<OptimizeFor>>>(cache_dir: &Path, optimize_for: T) -> EthashManager {
+	pub fn new<T: Into<Option<OptimizeFor>>>(cache_dir: &Path, optimize_for: T, progpow_transition: u64) -> EthashManager {
 		EthashManager {
 			cache_dir: cache_dir.to_path_buf(),
-			nodecache_builder: NodeCacheBuilder::new(optimize_for.into().unwrap_or_default()),
+			nodecache_builder: NodeCacheBuilder::new(optimize_for.into().unwrap_or_default(), progpow_transition),
+			progpow_transition: progpow_transition,
 			cache: Mutex::new(LightCache {
 				recent_epoch: None,
 				recent: None,
@@ -87,27 +102,33 @@ impl EthashManager {
 		let epoch = block_number / ETHASH_EPOCH_LENGTH;
 		let light = {
 			let mut lights = self.cache.lock();
-			let light = match lights.recent_epoch.clone() {
-				Some(ref e) if *e == epoch => lights.recent.clone(),
-				_ => match lights.prev_epoch.clone() {
-					Some(e) if e == epoch => {
-						// don't swap if recent is newer.
-						if lights.recent_epoch > lights.prev_epoch {
-							None
-						} else {
-							// swap
-							let t = lights.prev_epoch;
-							lights.prev_epoch = lights.recent_epoch;
-							lights.recent_epoch = t;
-							let t = lights.prev.clone();
-							lights.prev = lights.recent.clone();
-							lights.recent = t;
-							lights.recent.clone()
+			let light = if block_number == self.progpow_transition {
+				// we need to regenerate the cache to trigger algorithm change to progpow inside `Light`
+				None
+			} else {
+				match lights.recent_epoch.clone() {
+					Some(ref e) if *e == epoch => lights.recent.clone(),
+					_ => match lights.prev_epoch.clone() {
+						Some(e) if e == epoch => {
+							// don't swap if recent is newer.
+							if lights.recent_epoch > lights.prev_epoch {
+								None
+							} else {
+								// swap
+								let t = lights.prev_epoch;
+								lights.prev_epoch = lights.recent_epoch;
+								lights.recent_epoch = t;
+								let t = lights.prev.clone();
+								lights.prev = lights.recent.clone();
+								lights.recent = t;
+								lights.recent.clone()
+							}
 						}
-					}
-					_ => None,
-				},
+						_ => None,
+					},
+				}
 			};
+
 			match light {
 				None => {
 					let light = match self.nodecache_builder.light_from_file(
@@ -134,7 +155,7 @@ impl EthashManager {
 				Some(light) => light,
 			}
 		};
-		light.compute(header_hash, nonce)
+		light.compute(header_hash, nonce, block_number)
 	}
 }
 
@@ -166,7 +187,7 @@ fn test_lru() {
 	use tempdir::TempDir;
 
 	let tempdir = TempDir::new("").unwrap();
-	let ethash = EthashManager::new(tempdir.path(), None);
+	let ethash = EthashManager::new(tempdir.path(), None, u64::max_value());
 	let hash = [0u8; 32];
 	ethash.compute_light(1, &hash, 1);
 	ethash.compute_light(50000, &hash, 1);
@@ -215,101 +236,4 @@ fn test_difficulty_to_boundary_panics_on_zero() {
 #[should_panic]
 fn test_boundary_to_difficulty_panics_on_zero() {
 	boundary_to_difficulty(&ethereum_types::H256::from(0));
-}
-
-#[cfg(feature = "benches")]
-mod benchmarks {
-	extern crate test;
-
-	use self::test::Bencher;
-	use cache::{NodeCacheBuilder, OptimizeFor};
-	use compute::{Light, light_compute};
-
-	const HASH: [u8; 32] = [0xf5, 0x7e, 0x6f, 0x3a, 0xcf, 0xc0, 0xdd, 0x4b, 0x5b, 0xf2, 0xbe,
-	                        0xe4, 0x0a, 0xb3, 0x35, 0x8a, 0xa6, 0x87, 0x73, 0xa8, 0xd0, 0x9f,
-	                        0x5e, 0x59, 0x5e, 0xab, 0x55, 0x94, 0x05, 0x52, 0x7d, 0x72];
-	const NONCE: u64 = 0xd7b3ac70a301a249;
-
-	#[bench]
-	fn bench_light_compute_memmap(b: &mut Bencher) {
-		use std::env;
-
-		let builder = NodeCacheBuilder::new(OptimizeFor::Memory);
-		let light = builder.light(&env::temp_dir(), 486382);
-
-		b.iter(|| light_compute(&light, &HASH, NONCE));
-	}
-
-	#[bench]
-	fn bench_light_compute_memory(b: &mut Bencher) {
-		use std::env;
-
-		let builder = NodeCacheBuilder::new(OptimizeFor::Cpu);
-		let light = builder.light(&env::temp_dir(), 486382);
-
-		b.iter(|| light_compute(&light, &HASH, NONCE));
-	}
-
-	#[bench]
-	#[ignore]
-	fn bench_light_new_round_trip_memmap(b: &mut Bencher) {
-		use std::env;
-
-		b.iter(|| {
-			let builder = NodeCacheBuilder::new(OptimizeFor::Memory);
-			let light = builder.light(&env::temp_dir(), 486382);
-			light_compute(&light, &HASH, NONCE);
-		});
-	}
-
-	#[bench]
-	#[ignore]
-	fn bench_light_new_round_trip_memory(b: &mut Bencher) {
-		use std::env;
-
-		b.iter(|| {
-			let builder = NodeCacheBuilder::new(OptimizeFor::Cpu);
-			let light = builder.light(&env::temp_dir(), 486382);
-			light_compute(&light, &HASH, NONCE);
-		});
-	}
-
-	#[bench]
-	fn bench_light_from_file_round_trip_memory(b: &mut Bencher) {
-		use std::env;
-
-		let dir = env::temp_dir();
-		let height = 486382;
-		{
-			let builder = NodeCacheBuilder::new(OptimizeFor::Cpu);
-			let mut dummy = builder.light(&dir, height);
-			dummy.to_file().unwrap();
-		}
-
-		b.iter(|| {
-			let builder = NodeCacheBuilder::new(OptimizeFor::Cpu);
-			let light = builder.light_from_file(&dir, 486382).unwrap();
-			light_compute(&light, &HASH, NONCE);
-		});
-	}
-
-	#[bench]
-	fn bench_light_from_file_round_trip_memmap(b: &mut Bencher) {
-		use std::env;
-
-		let dir = env::temp_dir();
-		let height = 486382;
-
-		{
-			let builder = NodeCacheBuilder::new(OptimizeFor::Memory);
-			let mut dummy = builder.light(&dir, height);
-			dummy.to_file().unwrap();
-		}
-
-		b.iter(|| {
-			let builder = NodeCacheBuilder::new(OptimizeFor::Memory);
-			let light = builder.light_from_file(&dir, 486382).unwrap();
-			light_compute(&light, &HASH, NONCE);
-		});
-	}
 }

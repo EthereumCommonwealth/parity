@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Notifier for new transaction hashes.
 
@@ -20,9 +20,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use ethereum_types::H256;
+use futures::sync::mpsc;
 use txpool::{self, VerifiedTransaction};
 
 use pool::VerifiedTransaction as Transaction;
+use pool::TxStatus;
 
 type Listener = Box<Fn(&[H256]) + Send + Sync>;
 
@@ -50,6 +52,10 @@ impl Notifier {
 
 	/// Notify listeners about all currently pending transactions.
 	pub fn notify(&mut self) {
+		if self.pending.is_empty() {
+			return;
+		}
+
 		for l in &self.listeners {
 			(l)(&self.pending);
 		}
@@ -88,7 +94,7 @@ impl txpool::Listener<Transaction> for Logger {
 		}
 	}
 
-	fn rejected(&mut self, _tx: &Arc<Transaction>, reason: &txpool::ErrorKind) {
+	fn rejected<H: fmt::Debug + fmt::LowerHex>(&mut self, _tx: &Arc<Transaction>, reason: &txpool::Error<H>) {
 		trace!(target: "txqueue", "Rejected {}.", reason);
 	}
 
@@ -112,11 +118,70 @@ impl txpool::Listener<Transaction> for Logger {
 	}
 }
 
+/// Transactions pool notifier
+#[derive(Default)]
+pub struct TransactionsPoolNotifier {
+	listeners: Vec<mpsc::UnboundedSender<Arc<Vec<(H256, TxStatus)>>>>,
+	tx_statuses: Vec<(H256, TxStatus)>,
+}
+
+impl TransactionsPoolNotifier {
+	/// Add new listener to receive notifications.
+	pub fn add(&mut self, f: mpsc::UnboundedSender<Arc<Vec<(H256, TxStatus)>>>) {
+		self.listeners.push(f);
+	}
+
+	/// Notify listeners about all currently transactions.
+	pub fn notify(&mut self) {
+		if self.tx_statuses.is_empty() {
+			return;
+		}
+
+		let to_send = Arc::new(std::mem::replace(&mut self.tx_statuses, Vec::new()));
+		self.listeners
+			.retain(|listener| listener.unbounded_send(to_send.clone()).is_ok());
+	}
+}
+
+impl fmt::Debug for TransactionsPoolNotifier {
+	fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+		fmt.debug_struct("TransactionsPoolNotifier")
+			.field("listeners", &self.listeners.len())
+			.finish()
+	}
+}
+
+impl txpool::Listener<Transaction> for TransactionsPoolNotifier {
+	fn added(&mut self, tx: &Arc<Transaction>, _old: Option<&Arc<Transaction>>) {
+		self.tx_statuses.push((tx.hash.clone(), TxStatus::Added));
+	}
+
+	fn rejected<H: fmt::Debug + fmt::LowerHex>(&mut self, tx: &Arc<Transaction>, _reason: &txpool::Error<H>) {
+		self.tx_statuses.push((tx.hash.clone(), TxStatus::Rejected));
+	}
+
+	fn dropped(&mut self, tx: &Arc<Transaction>, _new: Option<&Transaction>) {
+		self.tx_statuses.push((tx.hash.clone(), TxStatus::Dropped));
+	}
+
+	fn invalid(&mut self, tx: &Arc<Transaction>) {
+		self.tx_statuses.push((tx.hash.clone(), TxStatus::Invalid));
+	}
+
+	fn canceled(&mut self, tx: &Arc<Transaction>) {
+		self.tx_statuses.push((tx.hash.clone(), TxStatus::Canceled));
+	}
+
+	fn culled(&mut self, tx: &Arc<Transaction>) {
+		self.tx_statuses.push((tx.hash.clone(), TxStatus::Culled));
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use parking_lot::Mutex;
-	use transaction;
+	use types::transaction;
 	use txpool::Listener;
 
 	#[test]

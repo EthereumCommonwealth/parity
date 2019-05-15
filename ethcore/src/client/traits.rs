@@ -1,56 +1,56 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use blockchain::{BlockReceipts, TreeRoute};
+use bytes::Bytes;
+use call_contract::{CallContract, RegistryInfo};
+use ethcore_miner::pool::VerifiedTransaction;
+use ethereum_types::{H256, U256, Address};
+use evm::Schedule;
 use itertools::Itertools;
+use kvdb::DBValue;
+use types::transaction::{self, LocalizedTransaction, SignedTransaction};
+use types::BlockNumber;
+use types::basic_account::BasicAccount;
+use types::block_status::BlockStatus;
+use types::blockchain_info::BlockChainInfo;
+use types::call_analytics::CallAnalytics;
+use types::encoded;
+use types::filter::Filter;
+use types::header::Header;
+use types::ids::*;
+use types::log_entry::LocalizedLogEntry;
+use types::pruning_info::PruningInfo;
+use types::receipt::LocalizedReceipt;
+use types::trace_filter::Filter as TraceFilter;
+use vm::LastHashes;
 
 use block::{OpenBlock, SealedBlock, ClosedBlock};
-use blockchain::TreeRoute;
 use client::Mode;
-use encoded;
-use vm::LastHashes;
-use error::{Error, CallError, EthcoreResult};
-use evm::Schedule;
+use engines::EthEngine;
+use error::{Error, EthcoreResult};
+use executed::CallError;
 use executive::Executed;
-use filter::Filter;
-use header::{BlockNumber};
-use log_entry::LocalizedLogEntry;
-use receipt::LocalizedReceipt;
+use state::StateInfo;
 use trace::LocalizedTrace;
-use transaction::{self, LocalizedTransaction, SignedTransaction};
 use verification::queue::QueueInfo as BlockQueueInfo;
 use verification::queue::kind::blocks::Unverified;
-use state::StateInfo;
-use header::Header;
-use engines::EthEngine;
-
-use ethereum_types::{H256, U256, Address};
-use ethcore_miner::pool::VerifiedTransaction;
-use bytes::Bytes;
-use kvdb::DBValue;
-
-use types::ids::*;
-use types::basic_account::BasicAccount;
-use types::trace_filter::Filter as TraceFilter;
-use types::call_analytics::CallAnalytics;
-use types::blockchain_info::BlockChainInfo;
-use types::block_status::BlockStatus;
-use types::pruning_info::PruningInfo;
 
 /// State information to be used during client query
 pub enum StateOrBlock {
@@ -158,23 +158,11 @@ pub trait StateClient {
 /// Provides various blockchain information, like block header, chain state etc.
 pub trait BlockChain: ChainInfo + BlockInfo + TransactionInfo {}
 
-/// Provides information on a blockchain service and it's registry
-pub trait RegistryInfo {
-	/// Get the address of a particular blockchain service, if available.
-	fn registry_address(&self, name: String, block: BlockId) -> Option<Address>;
-}
-
 // FIXME Why these methods belong to BlockChainClient and not MiningBlockChainClient?
 /// Provides methods to import block into blockchain
 pub trait ImportBlock {
 	/// Import a block into the blockchain.
 	fn import_block(&self, block: Unverified) -> EthcoreResult<H256>;
-}
-
-/// Provides `call_contract` method
-pub trait CallContract {
-	/// Like `call`, but with various defaults. Designed to be used for calling contracts.
-	fn call_contract(&self, id: BlockId, address: Address, data: Bytes) -> Result<Bytes, String>;
 }
 
 /// Provides `call` and `call_many` methods
@@ -249,6 +237,9 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 			.expect("code will return Some if given BlockId::Latest; qed")
 	}
 
+	/// Get block queue information.
+	fn queue_info(&self) -> BlockQueueInfo;
+
 	/// Get address code hash at given block's state.
 
 	/// Get value of the storage at given position at the given block's state.
@@ -282,7 +273,7 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 	fn transaction_receipt(&self, id: TransactionId) -> Option<LocalizedReceipt>;
 
 	/// Get localized receipts for all transaction in given block.
-	fn block_receipts(&self, id: BlockId) -> Option<Vec<LocalizedReceipt>>;
+	fn localized_block_receipts(&self, id: BlockId) -> Option<Vec<LocalizedReceipt>>;
 
 	/// Get a tree route between `from` and `to`.
 	/// See `BlockChain::tree_route`.
@@ -294,11 +285,13 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 	/// Get latest state node
 	fn state_data(&self, hash: &H256) -> Option<Bytes>;
 
-	/// Get raw block receipts data by block header hash.
-	fn encoded_block_receipts(&self, hash: &H256) -> Option<Bytes>;
+	/// Get block receipts data by block header hash.
+	fn block_receipts(&self, hash: &H256) -> Option<BlockReceipts>;
 
-	/// Get block queue information.
-	fn queue_info(&self) -> BlockQueueInfo;
+	/// Returns true if block queue is empty.
+	fn is_queue_empty(&self) -> bool {
+		self.queue_info().is_empty()
+	}
 
 	/// Clear block queue and abort all import activity.
 	fn clear_queue(&self);
@@ -367,7 +360,7 @@ pub trait BlockChainClient : Sync + Send + AccountData + BlockChain + CallContra
 	fn spec_name(&self) -> String;
 
 	/// Set the chain via a spec name.
-	fn set_spec_name(&self, spec_name: String);
+	fn set_spec_name(&self, spec_name: String) -> Result<(), ()>;
 
 	/// Disable the client from importing blocks. This cannot be undone in this session and indicates
 	/// that a subsystem has reason to believe this executable incapable of syncing the chain.
@@ -477,4 +470,10 @@ pub trait ProvingBlockChainClient: BlockChainClient {
 
 	/// Get an epoch change signal by block hash.
 	fn epoch_signal(&self, hash: H256) -> Option<Vec<u8>>;
+}
+
+/// resets the blockchain
+pub trait BlockChainReset {
+	/// reset to best_block - n
+	fn reset(&self, num: u32) -> Result<(), String>;
 }

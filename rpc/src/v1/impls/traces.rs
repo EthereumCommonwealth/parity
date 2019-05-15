@@ -1,33 +1,34 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Traces api implementation.
 
 use std::sync::Arc;
 
 use ethcore::client::{BlockChainClient, CallAnalytics, TransactionId, TraceId, StateClient, StateInfo, Call, BlockId};
+use ethereum_types::H256;
 use rlp::Rlp;
-use transaction::SignedTransaction;
+use types::transaction::SignedTransaction;
 
 use jsonrpc_core::Result;
-use jsonrpc_macros::Trailing;
 use v1::Metadata;
 use v1::traits::Traces;
 use v1::helpers::{errors, fake_sign};
-use v1::types::{TraceFilter, LocalizedTrace, BlockNumber, Index, CallRequest, Bytes, TraceResults, TraceResultsWithTransactionHash, TraceOptions, H256, block_number_to_id};
+use v1::types::{TraceFilter, LocalizedTrace, BlockNumber, Index, CallRequest, Bytes, TraceResults,
+	TraceResultsWithTransactionHash, TraceOptions, block_number_to_id};
 
 fn to_call_analytics(flags: TraceOptions) -> CallAnalytics {
 	CallAnalytics {
@@ -73,13 +74,13 @@ impl<C, S> Traces for TracesClient<C> where
 	}
 
 	fn transaction_traces(&self, transaction_hash: H256) -> Result<Option<Vec<LocalizedTrace>>> {
-		Ok(self.client.transaction_traces(TransactionId::Hash(transaction_hash.into()))
+		Ok(self.client.transaction_traces(TransactionId::Hash(transaction_hash))
 			.map(|traces| traces.into_iter().map(LocalizedTrace::from).collect()))
 	}
 
 	fn trace(&self, transaction_hash: H256, address: Vec<Index>) -> Result<Option<LocalizedTrace>> {
 		let id = TraceId {
-			transaction: TransactionId::Hash(transaction_hash.into()),
+			transaction: TransactionId::Hash(transaction_hash),
 			address: address.into_iter().map(|i| i.value()).collect()
 		};
 
@@ -87,7 +88,7 @@ impl<C, S> Traces for TracesClient<C> where
 			.map(LocalizedTrace::from))
 	}
 
-	fn call(&self, request: CallRequest, flags: TraceOptions, block: Trailing<BlockNumber>) -> Result<TraceResults> {
+	fn call(&self, request: CallRequest, flags: TraceOptions, block: Option<BlockNumber>) -> Result<TraceResults> {
 		let block = block.unwrap_or_default();
 
 		let request = CallRequest::into(request);
@@ -101,15 +102,15 @@ impl<C, S> Traces for TracesClient<C> where
 			BlockNumber::Pending => return Err(errors::invalid_params("`BlockNumber::Pending` is not supported", ())),
 		};
 
-		let mut state = self.client.state_at(id).ok_or(errors::state_pruned())?;
-		let header = self.client.block_header(id).ok_or(errors::state_pruned())?;
+		let mut state = self.client.state_at(id).ok_or_else(errors::state_pruned)?;
+		let header = self.client.block_header(id).ok_or_else(errors::state_pruned)?;
 
 		self.client.call(&signed, to_call_analytics(flags), &mut state, &header.decode().map_err(errors::decode)?)
 			.map(TraceResults::from)
 			.map_err(errors::call)
 	}
 
-	fn call_many(&self, requests: Vec<(CallRequest, TraceOptions)>, block: Trailing<BlockNumber>) -> Result<Vec<TraceResults>> {
+	fn call_many(&self, requests: Vec<(CallRequest, TraceOptions)>, block: Option<BlockNumber>) -> Result<Vec<TraceResults>> {
 		let block = block.unwrap_or_default();
 
 		let requests = requests.into_iter()
@@ -128,15 +129,15 @@ impl<C, S> Traces for TracesClient<C> where
 			BlockNumber::Pending => return Err(errors::invalid_params("`BlockNumber::Pending` is not supported", ())),
 		};
 
-		let mut state = self.client.state_at(id).ok_or(errors::state_pruned())?;
-		let header = self.client.block_header(id).ok_or(errors::state_pruned())?;
+		let mut state = self.client.state_at(id).ok_or_else(errors::state_pruned)?;
+		let header = self.client.block_header(id).ok_or_else(errors::state_pruned)?;
 
 		self.client.call_many(&requests, &mut state, &header.decode().map_err(errors::decode)?)
 			.map(|results| results.into_iter().map(TraceResults::from).collect())
 			.map_err(errors::call)
 	}
 
-	fn raw_transaction(&self, raw_transaction: Bytes, flags: TraceOptions, block: Trailing<BlockNumber>) -> Result<TraceResults> {
+	fn raw_transaction(&self, raw_transaction: Bytes, flags: TraceOptions, block: Option<BlockNumber>) -> Result<TraceResults> {
 		let block = block.unwrap_or_default();
 
 		let tx = Rlp::new(&raw_transaction.into_vec()).as_val().map_err(|e| errors::invalid_params("Transaction is not valid RLP", e))?;
@@ -150,8 +151,8 @@ impl<C, S> Traces for TracesClient<C> where
 			BlockNumber::Pending => return Err(errors::invalid_params("`BlockNumber::Pending` is not supported", ())),
 		};
 
-		let mut state = self.client.state_at(id).ok_or(errors::state_pruned())?;
-		let header = self.client.block_header(id).ok_or(errors::state_pruned())?;
+		let mut state = self.client.state_at(id).ok_or_else(errors::state_pruned)?;
+		let header = self.client.block_header(id).ok_or_else(errors::state_pruned)?;
 
 		self.client.call(&signed, to_call_analytics(flags), &mut state, &header.decode().map_err(errors::decode)?)
 			.map(TraceResults::from)
@@ -159,7 +160,7 @@ impl<C, S> Traces for TracesClient<C> where
 	}
 
 	fn replay_transaction(&self, transaction_hash: H256, flags: TraceOptions) -> Result<TraceResults> {
-		self.client.replay(TransactionId::Hash(transaction_hash.into()), to_call_analytics(flags))
+		self.client.replay(TransactionId::Hash(transaction_hash), to_call_analytics(flags))
 			.map(TraceResults::from)
 			.map_err(errors::call)
 	}
@@ -174,7 +175,7 @@ impl<C, S> Traces for TracesClient<C> where
 		};
 
 		self.client.replay_block_transactions(id, to_call_analytics(flags))
-			.map(|results| results.into_iter().map(TraceResultsWithTransactionHash::from).collect())
+			.map(|results| results.map(TraceResultsWithTransactionHash::from).collect())
 			.map_err(errors::call)
 	}
 }

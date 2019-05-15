@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::sync::Arc;
 use std::cmp;
@@ -25,10 +25,10 @@ use heapsize::HeapSizeOf;
 use ethkey::Signature;
 use messages::PrivateTransaction;
 use parking_lot::RwLock;
-use transaction::{UnverifiedTransaction, SignedTransaction};
+use types::transaction::{UnverifiedTransaction, SignedTransaction};
 use txpool;
 use txpool::{VerifiedTransaction, Verifier};
-use error::{Error, ErrorKind};
+use error::Error;
 
 type Pool = txpool::Pool<VerifiedPrivateTransaction, pool::scoring::NonceAndGasPrice>;
 
@@ -154,7 +154,7 @@ impl Default for VerificationStore {
 
 impl VerificationStore {
 	/// Adds private transaction for verification into the store
-	pub fn add_transaction<C: pool::client::Client>(
+	pub fn add_transaction<C: pool::client::Client + pool::client::NonceClient + Clone>(
 		&self,
 		transaction: UnverifiedTransaction,
 		validator_account: Option<Address>,
@@ -164,7 +164,7 @@ impl VerificationStore {
 
 		let options = self.verification_options.clone();
 		// Use pool's verifying pipeline for original transaction's verification
-		let verifier = pool::verifier::Verifier::new(client, options, Default::default(), None);
+		let verifier = pool::verifier::Verifier::new(client.clone(), options, Default::default(), None);
 		let unverified = pool::verifier::Transaction::Unverified(transaction);
 		let verified_tx = verifier.verify_transaction(unverified)?;
 		let signed_tx: SignedTransaction = verified_tx.signed().clone();
@@ -177,8 +177,9 @@ impl VerificationStore {
 			transaction_hash: signed_hash,
 			transaction_sender: signed_sender,
 		};
-		let mut pool = self.verification_pool.write();
-		pool.import(verified)?;
+		let replace = pool::replace::ReplaceByScoreAndReadiness::new(
+			self.verification_pool.read().scoring().clone(), client);
+		self.verification_pool.write().import(verified, &replace)?;
 		Ok(())
 	}
 
@@ -223,12 +224,12 @@ impl SigningStore {
 		&mut self,
 		private_hash: H256,
 		transaction: SignedTransaction,
-		validators: Vec<Address>,
+		validators: &Vec<Address>,
 		state: Bytes,
 		contract_nonce: U256,
 	) -> Result<(), Error> {
 		if self.transactions.len() > MAX_QUEUE_LEN {
-			bail!(ErrorKind::QueueIsFull);
+			return Err(Error::QueueIsFull);
 		}
 
 		self.transactions.insert(private_hash, PrivateTransactionSigningDesc {
@@ -254,7 +255,7 @@ impl SigningStore {
 
 	/// Adds received signature for the stored private transaction
 	pub fn add_signature(&mut self, private_hash: &H256, signature: Signature) -> Result<(), Error> {
-		let desc = self.transactions.get_mut(private_hash).ok_or_else(|| ErrorKind::PrivateTransactionNotFound)?;
+		let desc = self.transactions.get_mut(private_hash).ok_or_else(|| Error::PrivateTransactionNotFound)?;
 		if !desc.received_signatures.contains(&signature) {
 			desc.received_signatures.push(signature);
 		}

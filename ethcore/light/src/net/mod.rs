@@ -1,25 +1,24 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! PLP Protocol Version 1 implementation.
 //!
 //! This uses a "Provider" to answer requests.
 
-use transaction::UnverifiedTransaction;
-
+use common_types::transaction::UnverifiedTransaction;
 use ethereum_types::{H256, U256};
 use io::TimerToken;
 use kvdb::DBValue;
@@ -28,7 +27,7 @@ use parking_lot::{Mutex, RwLock};
 use provider::Provider;
 use request::{Request, NetworkRequests as Requests, Response};
 use rlp::{RlpStream, Rlp};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::ops::{BitOr, BitAnd, Not};
 use std::sync::Arc;
@@ -38,7 +37,7 @@ use std::time::{Duration, Instant};
 use self::request_credits::{Credits, FlowParams};
 use self::context::{Ctx, TickCtx};
 use self::error::Punishment;
-use self::load_timer::{LoadDistribution, NullStore};
+use self::load_timer::{LoadDistribution, NullStore, MOVING_SAMPLE_SIZE};
 use self::request_set::RequestSet;
 use self::id_guard::IdGuard;
 
@@ -69,6 +68,16 @@ const PROPAGATE_TIMEOUT_INTERVAL: Duration = Duration::from_secs(5);
 
 const RECALCULATE_COSTS_TIMEOUT: TimerToken = 3;
 const RECALCULATE_COSTS_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+const STATISTICS_TIMEOUT: TimerToken = 4;
+const STATISTICS_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Maximum load share for the light server
+pub const MAX_LIGHTSERV_LOAD: f64 = 0.5;
+
+/// Factor to multiply leecher count to cater for
+/// extra sudden connections (should be >= 1.0)
+pub const LEECHER_COUNT_FACTOR: f64 = 1.25;
 
 // minimum interval between updates.
 const UPDATE_INTERVAL: Duration = Duration::from_millis(5000);
@@ -256,18 +265,18 @@ pub trait Handler: Send + Sync {
 pub struct Config {
 	/// How many stored seconds of credits peers should be able to accumulate.
 	pub max_stored_seconds: u64,
-	/// How much of the total load capacity each peer should be allowed to take.
-	pub load_share: f64,
+	/// The network config median peers (used as default peer count)
+	pub median_peers: f64,
 }
 
 impl Default for Config {
 	fn default() -> Self {
-		const LOAD_SHARE: f64 = 1.0 / 25.0;
+		const MEDIAN_PEERS: f64 = 25.0;
 		const MAX_ACCUMULATED: u64 = 60 * 5; // only charge for 5 minutes.
 
 		Config {
 			max_stored_seconds: MAX_ACCUMULATED,
-			load_share: LOAD_SHARE,
+			median_peers: MEDIAN_PEERS,
 		}
 	}
 }
@@ -335,6 +344,42 @@ mod id_guard {
 	}
 }
 
+/// Provides various statistics that could
+/// be used to compute costs
+pub struct Statistics {
+	/// Samples of peer count
+	peer_counts: VecDeque<usize>,
+}
+
+impl Statistics {
+	/// Create a new Statistics instance
+	pub fn new() -> Self {
+		Statistics {
+			peer_counts: VecDeque::with_capacity(MOVING_SAMPLE_SIZE),
+		}
+	}
+
+	/// Add a new peer_count sample
+	pub fn add_peer_count(&mut self, peer_count: usize) {
+		while self.peer_counts.len() >= MOVING_SAMPLE_SIZE {
+			self.peer_counts.pop_front();
+		}
+		self.peer_counts.push_back(peer_count);
+	}
+
+	/// Get the average peer count from previous samples. Is always >= 1.0
+	pub fn avg_peer_count(&self) -> f64 {
+		let len = self.peer_counts.len();
+		if len == 0 {
+			return 1.0;
+		}
+		let avg = self.peer_counts.iter()
+			.fold(0, |sum: u32, &v| sum.saturating_add(v as u32)) as f64
+			/ len as f64;
+		avg.max(1.0)
+	}
+}
+
 /// This is an implementation of the light ethereum network protocol, abstracted
 /// over a `Provider` of data and a p2p network.
 ///
@@ -359,6 +404,7 @@ pub struct LightProtocol {
 	req_id: AtomicUsize,
 	sample_store: Box<SampleStore>,
 	load_distribution: LoadDistribution,
+	statistics: RwLock<Statistics>,
 }
 
 impl LightProtocol {
@@ -369,9 +415,11 @@ impl LightProtocol {
 		let genesis_hash = provider.chain_info().genesis_hash;
 		let sample_store = params.sample_store.unwrap_or_else(|| Box::new(NullStore));
 		let load_distribution = LoadDistribution::load(&*sample_store);
+		// Default load share relative to median peers
+		let load_share = MAX_LIGHTSERV_LOAD / params.config.median_peers;
 		let flow_params = FlowParams::from_request_times(
 			|kind| load_distribution.expected_time(kind),
-			params.config.load_share,
+			load_share,
 			Duration::from_secs(params.config.max_stored_seconds),
 		);
 
@@ -389,6 +437,7 @@ impl LightProtocol {
 			req_id: AtomicUsize::new(0),
 			sample_store,
 			load_distribution,
+			statistics: RwLock::new(Statistics::new()),
 		}
 	}
 
@@ -406,6 +455,16 @@ impl LightProtocol {
 			num_pending + peers.len(),
 			peers.values().filter(|p| !p.lock().pending_requests.is_empty()).count(),
 		)
+	}
+
+	/// Get the number of active light peers downloading from the
+	/// node
+	pub fn leecher_count(&self) -> usize {
+		let credit_limit = *self.flow_params.read().limit();
+		// Count the number of peers that used some credit
+		self.peers.read().iter()
+			.filter(|(_, p)| p.lock().local_credits.current() < credit_limit)
+			.count()
 	}
 
 	/// Make a request to a peer.
@@ -474,6 +533,9 @@ impl LightProtocol {
 			// the timer approach will skip 1 (possibly 2) in rare occasions.
 			if peer_info.sent_head == announcement.head_hash ||
 				peer_info.status.head_num >= announcement.head_num ||
+				// fix for underflow reported in
+				// https://github.com/paritytech/parity-ethereum/issues/10419
+				now < peer_info.last_update ||
 				now - peer_info.last_update < UPDATE_INTERVAL {
 				continue
 			}
@@ -772,12 +834,16 @@ impl LightProtocol {
 	fn begin_new_cost_period(&self, io: &IoContext) {
 		self.load_distribution.end_period(&*self.sample_store);
 
+		let avg_peer_count = self.statistics.read().avg_peer_count();
+		// Load share relative to average peer count +LEECHER_COUNT_FACTOR%
+		let load_share = MAX_LIGHTSERV_LOAD / (avg_peer_count * LEECHER_COUNT_FACTOR);
 		let new_params = Arc::new(FlowParams::from_request_times(
 			|kind| self.load_distribution.expected_time(kind),
-			self.config.load_share,
+			load_share,
 			Duration::from_secs(self.config.max_stored_seconds),
 		));
 		*self.flow_params.write() = new_params.clone();
+		trace!(target: "pip", "New cost period: avg_peers={} ; cost_table:{:?}", avg_peer_count, new_params.cost_table());
 
 		let peers = self.peers.read();
 		let now = Instant::now();
@@ -796,6 +862,11 @@ impl LightProtocol {
 			io.send(*peer_id, packet::UPDATE_CREDITS, packet_body.clone());
 			peer_info.awaiting_acknowledge = Some((now, new_params.clone()));
 		}
+	}
+
+	fn tick_statistics(&self) {
+		let leecher_count = self.leecher_count();
+		self.statistics.write().add_peer_count(leecher_count);
 	}
 }
 
@@ -1099,6 +1170,8 @@ impl NetworkProtocolHandler for LightProtocol {
 			.expect("Error registering sync timer.");
 		io.register_timer(RECALCULATE_COSTS_TIMEOUT, RECALCULATE_COSTS_INTERVAL)
 			.expect("Error registering request timer interval token.");
+		io.register_timer(STATISTICS_TIMEOUT, STATISTICS_INTERVAL)
+			.expect("Error registering statistics timer.");
 	}
 
 	fn read(&self, io: &NetworkContext, peer: &PeerId, packet_id: u8, data: &[u8]) {
@@ -1119,6 +1192,7 @@ impl NetworkProtocolHandler for LightProtocol {
 			TICK_TIMEOUT => self.tick_handlers(&io),
 			PROPAGATE_TIMEOUT => self.propagate_transactions(&io),
 			RECALCULATE_COSTS_TIMEOUT => self.begin_new_cost_period(&io),
+			STATISTICS_TIMEOUT => self.tick_statistics(),
 			_ => warn!(target: "pip", "received timeout on unknown token {}", timer),
 		}
 	}

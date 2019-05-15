@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use ethereum_types::U256;
 use vm::ReturnData;
@@ -38,7 +38,6 @@ pub trait Memory {
 	fn read_slice(&self, offset: U256, size: U256) -> &[u8];
 	/// Retrieve writeable part of memory
 	fn writeable_slice(&mut self, offset: U256, size: U256) -> &mut[u8];
-	fn dump(&self);
 	/// Convert memory into return data.
 	fn into_return_data(self, offset: U256, size: U256) -> ReturnData;
 }
@@ -51,14 +50,6 @@ pub fn is_valid_range(off: usize, size: usize)  -> bool {
 }
 
 impl Memory for Vec<u8> {
-	fn dump(&self) {
-		println!("MemoryDump:");
-		for i in self.iter() {
-			println!("{:02x} ", i);
-		}
-		println!("");
-	}
-
 	fn size(&self) -> usize {
 		self.len()
 	}

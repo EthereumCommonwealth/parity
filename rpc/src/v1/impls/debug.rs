@@ -1,25 +1,26 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Debug APIs RPC implementation
 
 use std::sync::Arc;
 
 use ethcore::client::BlockChainClient;
-use transaction::LocalizedTransaction;
+use types::header::Header;
+use types::transaction::LocalizedTransaction;
 
 use jsonrpc_core::Result;
 use v1::traits::Debug;
@@ -50,7 +51,7 @@ impl<C: BlockChainClient + 'static> Debug for DebugClient<C> {
 			let hash = block.header.hash();
 			RichBlock {
 				inner: Block {
-					hash: Some(hash.into()),
+					hash: Some(hash),
 					size: Some(block.bytes.len().into()),
 					parent_hash: cast(block.header.parent_hash()),
 					uncles_hash: cast(block.header.uncles_hash()),
@@ -65,14 +66,14 @@ impl<C: BlockChainClient + 'static> Debug for DebugClient<C> {
 					timestamp: block.header.timestamp().into(),
 					difficulty: cast(block.header.difficulty()),
 					total_difficulty: None,
-					seal_fields: block.header.seal().into_iter().cloned().map(Into::into).collect(),
-					uncles: block.uncles.into_iter().map(|u| u.hash().into()).collect(),
+					seal_fields: block.header.seal().iter().cloned().map(Into::into).collect(),
+					uncles: block.uncles.iter().map(Header::hash).collect(),
 					transactions: BlockTransactions::Full(block.transactions
 						.into_iter()
 						.enumerate()
 						.map(|(transaction_index, signed)| Transaction::from_localized(LocalizedTransaction {
-							block_number: number.into(),
-							block_hash: hash.into(),
+							block_number: number,
+							block_hash: hash,
 							transaction_index,
 							signed,
 							cached_sender: None,

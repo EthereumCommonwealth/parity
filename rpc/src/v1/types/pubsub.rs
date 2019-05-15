@@ -1,35 +1,46 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Pub-Sub types.
 
+use ethereum_types::H256;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::de::Error;
 use serde_json::{Value, from_value};
-use v1::types::{RichHeader, Filter, Log, H256};
+use v1::types::{RichHeader, Filter, Log};
 
 /// Subscription result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Result {
 	/// New block header.
-	Header(RichHeader),
+	Header(Box<RichHeader>),
 	/// Log
-	Log(Log),
+	Log(Box<Log>),
 	/// Transaction hash
 	TransactionHash(H256),
+	/// SyncStatus
+	SyncState(PubSubSyncStatus)
+}
+
+/// PubSbub sync status
+#[derive(Debug, Serialize, Eq, PartialEq, Clone)]
+#[serde(rename_all="camelCase")]
+pub struct PubSubSyncStatus {
+	/// is_major_syncing?
+	pub syncing: bool,
 }
 
 impl Serialize for Result {
@@ -40,6 +51,7 @@ impl Serialize for Result {
 			Result::Header(ref header) => header.serialize(serializer),
 			Result::Log(ref log) => log.serialize(serializer),
 			Result::TransactionHash(ref hash) => hash.serialize(serializer),
+			Result::SyncState(ref sync) => sync.serialize(serializer),
 		}
 	}
 }
@@ -143,7 +155,7 @@ mod tests {
 
 	#[test]
 	fn should_serialize_header() {
-		let header = Result::Header(RichHeader {
+		let header = Result::Header(Box::new(RichHeader {
 			extra_info: Default::default(),
 			inner: Header {
 				hash: Some(Default::default()),
@@ -164,7 +176,7 @@ mod tests {
 				seal_fields: vec![Default::default(), Default::default()],
 				size: Some(69.into()),
 			},
-		});
+		}));
 		let expected = r#"{"author":"0x0000000000000000000000000000000000000000","difficulty":"0x0","extraData":"0x","gasLimit":"0x0","gasUsed":"0x0","hash":"0x0000000000000000000000000000000000000000000000000000000000000000","logsBloom":"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","miner":"0x0000000000000000000000000000000000000000","number":"0x0","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000","receiptsRoot":"0x0000000000000000000000000000000000000000000000000000000000000000","sealFields":["0x","0x"],"sha3Uncles":"0x0000000000000000000000000000000000000000000000000000000000000000","size":"0x45","stateRoot":"0x0000000000000000000000000000000000000000000000000000000000000000","timestamp":"0x0","transactionsRoot":"0x0000000000000000000000000000000000000000000000000000000000000000"}"#;
 		assert_eq!(serde_json::to_string(&header).unwrap(), expected);
 	}

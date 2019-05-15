@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Types used in Confirmations queue (Trusted Signer)
 
@@ -21,7 +21,8 @@ use serde::{Serialize, Serializer};
 use ansi_term::Colour;
 use bytes::ToPretty;
 
-use v1::types::{U256, TransactionRequest, RichRawTransaction, H160, H256, H520, Bytes, TransactionCondition, Origin};
+use ethereum_types::{H160, H256, H520, U256};
+use v1::types::{TransactionRequest, RichRawTransaction, Bytes, TransactionCondition, Origin};
 use v1::helpers;
 use ethkey::Password;
 
@@ -40,7 +41,7 @@ pub struct ConfirmationRequest {
 impl From<helpers::ConfirmationRequest> for ConfirmationRequest {
 	fn from(c: helpers::ConfirmationRequest) -> Self {
 		ConfirmationRequest {
-			id: c.id.into(),
+			id: c.id,
 			payload: c.payload.into(),
 			origin: c.origin,
 		}
@@ -59,31 +60,62 @@ impl fmt::Display for ConfirmationPayload {
 			ConfirmationPayload::SendTransaction(ref transaction) => write!(f, "{}", transaction),
 			ConfirmationPayload::SignTransaction(ref transaction) => write!(f, "(Sign only) {}", transaction),
 			ConfirmationPayload::EthSignMessage(ref sign) => write!(f, "{}", sign),
+			ConfirmationPayload::EIP191SignMessage(ref sign) => write!(f, "{}", sign),
 			ConfirmationPayload::Decrypt(ref decrypt) => write!(f, "{}", decrypt),
 		}
 	}
 }
 
-/// Sign request
+/// Ethereum-prefixed Sign request
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignRequest {
+pub struct EthSignRequest {
 	/// Address
 	pub address: H160,
 	/// Hash to sign
 	pub data: Bytes,
 }
 
-impl From<(H160, Bytes)> for SignRequest {
-	fn from(tuple: (H160, Bytes)) -> Self {
-		SignRequest {
+/// EIP191 Sign request
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EIP191SignRequest {
+	/// Address
+	pub address: H160,
+	/// Hash to sign
+	pub data: H256,
+}
+
+impl From<(H160, H256)> for EIP191SignRequest {
+	fn from(tuple: (H160, H256)) -> Self {
+		EIP191SignRequest {
 			address: tuple.0,
 			data: tuple.1,
 		}
 	}
 }
 
-impl fmt::Display for SignRequest {
+impl fmt::Display for EIP191SignRequest {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		write!(
+			f,
+			"sign 0x{} with {}",
+			self.data.0.pretty(),
+			Colour::White.bold().paint(format!("0x{:?}", self.address)),
+		)
+	}
+}
+
+impl From<(H160, Bytes)> for EthSignRequest {
+	fn from(tuple: (H160, Bytes)) -> Self {
+		EthSignRequest {
+			address: tuple.0,
+			data: tuple.1,
+		}
+	}
+}
+
+impl fmt::Display for EthSignRequest {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		write!(
 			f,
@@ -169,7 +201,9 @@ pub enum ConfirmationPayload {
 	SignTransaction(TransactionRequest),
 	/// Signature
 	#[serde(rename = "sign")]
-	EthSignMessage(SignRequest),
+	EthSignMessage(EthSignRequest),
+	/// signature without prefix
+	EIP191SignMessage(EIP191SignRequest),
 	/// Decryption
 	Decrypt(DecryptRequest),
 }
@@ -179,12 +213,16 @@ impl From<helpers::ConfirmationPayload> for ConfirmationPayload {
 		match c {
 			helpers::ConfirmationPayload::SendTransaction(t) => ConfirmationPayload::SendTransaction(t.into()),
 			helpers::ConfirmationPayload::SignTransaction(t) => ConfirmationPayload::SignTransaction(t.into()),
-			helpers::ConfirmationPayload::EthSignMessage(address, data) => ConfirmationPayload::EthSignMessage(SignRequest {
-				address: address.into(),
+			helpers::ConfirmationPayload::EthSignMessage(address, data) => ConfirmationPayload::EthSignMessage(EthSignRequest {
+				address,
 				data: data.into(),
 			}),
+			helpers::ConfirmationPayload::SignMessage(address, data) => ConfirmationPayload::EIP191SignMessage(EIP191SignRequest {
+				address,
+				data,
+			}),
 			helpers::ConfirmationPayload::Decrypt(address, msg) => ConfirmationPayload::Decrypt(DecryptRequest {
-				address: address.into(),
+				address,
 				msg: msg.into(),
 			}),
 		}
@@ -244,8 +282,9 @@ impl<A, B> Serialize for Either<A, B>  where
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
+    use ethereum_types::{H256, U256};
 	use serde_json;
-	use v1::types::{U256, H256, TransactionCondition};
+	use v1::types::TransactionCondition;
 	use v1::helpers;
 	use super::*;
 

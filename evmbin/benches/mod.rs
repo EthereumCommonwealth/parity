@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! benchmarking for EVM
 //! should be started with:
@@ -25,16 +25,18 @@
 extern crate test;
 extern crate ethcore;
 extern crate evm;
-extern crate ethcore_util;
-extern crate ethcore_bigint;
+extern crate ethereum_types;
 extern crate rustc_hex;
+extern crate vm;
 
+use std::sync::Arc;
 use self::test::{Bencher, black_box};
 
-use evm::run_vm;
-use ethcore::vm::ActionParams;
-use ethcore_bigint::prelude::U256;
+use ethereum_types::U256;
+use evm::Factory;
 use rustc_hex::FromHex;
+use vm::tests::FakeExt;
+use vm::{ActionParams, Ext};
 
 #[bench]
 fn simple_loop_usize(b: &mut Bencher) {
@@ -54,9 +56,11 @@ fn simple_loop(gas: U256, b: &mut Bencher) {
 	b.iter(|| {
 		let mut params = ActionParams::default();
 		params.gas = gas;
-		params.code = Some(code.clone());
+		params.code = Some(Arc::new(code.clone()));
 
-		run_vm(params)
+		let mut ext = FakeExt::new();
+		let evm = Factory::default().create(params, ext.schedule(), ext.depth());
+		let _ = evm.exec(&mut ext);
 	});
 }
 
@@ -78,8 +82,10 @@ fn rng(gas: U256, b: &mut Bencher) {
 	b.iter(|| {
 		let mut params = ActionParams::default();
 		params.gas = gas;
-		params.code = Some(code.clone());
+		params.code = Some(Arc::new(code.clone()));
 
-		run_vm(params)
+		let mut ext = FakeExt::new();
+		let evm = Factory::default().create(params, ext.schedule(), ext.depth());
+		let _ = evm.exec(&mut ext);
 	});
 }

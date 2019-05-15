@@ -1,24 +1,26 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
+use futures::future::{self, Loop};
 use std::sync::Arc;
 use std::thread::{JoinHandle, self};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use deque;
 use service_mio::{HandlerId, IoChannel, IoContext};
+use tokio::{self};
 use IoHandler;
 use LOCAL_STACK_SIZE;
 
@@ -69,35 +71,31 @@ impl Worker {
 		worker.thread = Some(thread::Builder::new().stack_size(STACK_SIZE).name(format!("IO Worker #{}", index)).spawn(
 			move || {
 				LOCAL_STACK_SIZE.with(|val| val.set(STACK_SIZE));
-				Worker::work_loop(stealer, channel.clone(), wait, wait_mutex.clone(), deleting)
+				let ini = (stealer, channel.clone(), wait, wait_mutex.clone(), deleting);
+				let future = future::loop_fn(ini, |(stealer, channel, wait, wait_mutex, deleting)| {
+					{
+						let mut lock = wait_mutex.lock();
+						if deleting.load(AtomicOrdering::Acquire) {
+							return Ok(Loop::Break(()));
+						}
+						wait.wait(&mut lock);
+					}
+
+					while !deleting.load(AtomicOrdering::Acquire) {
+						match stealer.steal() {
+							deque::Steal::Data(work) => Worker::do_work(work, channel.clone()),
+							deque::Steal::Retry => {},
+							deque::Steal::Empty => break,
+						}
+					}
+					Ok(Loop::Continue((stealer, channel, wait, wait_mutex, deleting)))
+				});
+				if let Err(()) = tokio::runtime::current_thread::block_on_all(future) {
+					error!(target: "ioworker", "error while executing future")
+				}
 			})
 			.expect("Error creating worker thread"));
 		worker
-	}
-
-	fn work_loop<Message>(stealer: deque::Stealer<Work<Message>>,
-						channel: IoChannel<Message>,
-						wait: Arc<Condvar>,
-						wait_mutex: Arc<Mutex<()>>,
-						deleting: Arc<AtomicBool>)
-						where Message: Send + Sync + 'static {
-		loop {
-			{
-				let mut lock = wait_mutex.lock();
-				if deleting.load(AtomicOrdering::Acquire) {
-					return;
-				}
-				wait.wait(&mut lock);
-			}
-
-			while !deleting.load(AtomicOrdering::Acquire) {
-				match stealer.steal() {
-					deque::Steal::Data(work) => Worker::do_work(work, channel.clone()),
-					deque::Steal::Retry => {},
-					deque::Steal::Empty => break,
-				}
-			}
-		}
 	}
 
 	fn do_work<Message>(work: Work<Message>, channel: IoChannel<Message>) where Message: Send + Sync + 'static {

@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Account system expressed in Plain Old Data.
 
@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use itertools::Itertools;
 use hash::{keccak};
 use ethereum_types::{H256, U256};
-use hashdb::HashDB;
+use hash_db::HashDB;
 use kvdb::DBValue;
 use keccak_hasher::KeccakHasher;
 use triehash::sec_trie_root;
@@ -32,8 +32,10 @@ use state::Account;
 use ethjson;
 use types::account_diff::*;
 use rlp::{self, RlpStream};
+use serde::Serializer;
+use rustc_hex::ToHex;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 /// An account, expressed as Plain-Old-Data (hence the name).
 /// Does not have a DB overlay cache, code hash or anything like that.
 pub struct PodAccount {
@@ -41,10 +43,17 @@ pub struct PodAccount {
 	pub balance: U256,
 	/// The nonce of the account.
 	pub nonce: U256,
+	#[serde(serialize_with="opt_bytes_to_hex")]
 	/// The code of the account or `None` in the special case that it is unknown.
 	pub code: Option<Bytes>,
 	/// The storage of the account.
 	pub storage: BTreeMap<H256, H256>,
+}
+
+fn opt_bytes_to_hex<S>(opt_bytes: &Option<Bytes>, serializer: S) -> Result<S::Ok, S::Error>
+	where S: Serializer
+{
+	serializer.collect_str(&format_args!("0x{}",opt_bytes.as_ref().map_or("".to_string(), |b|b.to_hex())))
 }
 
 impl PodAccount {

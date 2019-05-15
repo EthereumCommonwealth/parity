@@ -1,22 +1,25 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 #[macro_use]
 mod usage;
 mod presets;
+
+use std::collections::HashSet;
+use super::helpers;
 
 usage! {
 	{
@@ -217,6 +220,15 @@ usage! {
 			CMD cmd_db_kill {
 				"Clean the database of the given --chain (default: mainnet)",
 			}
+
+			CMD cmd_db_reset {
+				"Removes NUM latests blocks from the db",
+
+				ARG arg_db_reset_num: (u32) = 10u32,
+				"<NUM>",
+				"Number of blocks to revert",
+			}
+
 		}
 
 		CMD cmd_export_hardcoded_sync
@@ -288,7 +300,7 @@ usage! {
 
 			ARG arg_chain: (String) = "foundation", or |c: &Config| c.parity.as_ref()?.chain.clone(),
 			"--chain=[CHAIN]",
-			"Specify the blockchain type. CHAIN may be either a JSON chain specification file or ethereum, classic, poacore, tobalaba, expanse, musicoin, ellaism, easthub, social, mix, callisto, morden, ropsten, kovan, poasokol, testnet, or dev.",
+			"Specify the blockchain type. CHAIN may be either a JSON chain specification file or ethereum, classic, poacore, tobalaba, expanse, musicoin, ellaism, mix, callisto, morden, ropsten, kovan, rinkeby, goerli, kotti, poasokol, testnet, or dev.",
 
 			ARG arg_keys_path: (String) = "$BASE/keys", or |c: &Config| c.parity.as_ref()?.keys_path.clone(),
 			"--keys-path=[PATH]",
@@ -309,7 +321,7 @@ usage! {
 		["Convenience Options"]
 			FLAG flag_unsafe_expose: (bool) = false, or |c: &Config| c.misc.as_ref()?.unsafe_expose,
 			"--unsafe-expose",
-			"All servers will listen on external interfaces and will be remotely accessible. It's equivalent with setting the following: --[ws,jsonrpc,ui,ipfs-api,secretstore,stratum,dapps,secretstore-http]-interface=all --*-hosts=all    This option is UNSAFE and should be used with great care!",
+			"All servers will listen on external interfaces and will be remotely accessible. It's equivalent with setting the following: --[ws,jsonrpc,ipfs-api,secretstore,stratum,dapps,secretstore-http]-interface=all --*-hosts=all    This option is UNSAFE and should be used with great care!",
 
 			ARG arg_config: (String) = "$BASE/config.toml", or |_| None,
 			"-c, --config=[CONFIG]",
@@ -461,8 +473,11 @@ usage! {
 				Ok(())
 			},
 
-
 		["API and Console Options – HTTP JSON-RPC"]
+			FLAG flag_jsonrpc_allow_missing_blocks: (bool) = false, or |c: &Config| c.rpc.as_ref()?.allow_missing_blocks.clone(),
+			"--jsonrpc-allow-missing-blocks",
+			"RPC calls will return 'null' instead of an error if ancient block sync is still in progress and the block information requested could not be found",
+
 			FLAG flag_no_jsonrpc: (bool) = false, or |c: &Config| c.rpc.as_ref()?.disable.clone(),
 			"--no-jsonrpc",
 			"Disable the HTTP JSON-RPC API server.",
@@ -470,6 +485,10 @@ usage! {
 			FLAG flag_jsonrpc_no_keep_alive: (bool) = false, or |c: &Config| c.rpc.as_ref()?.keep_alive,
 			"--jsonrpc-no-keep-alive",
 			"Disable HTTP/1.1 keep alive header. Disabling keep alive will prevent re-using the same TCP connection to fire multiple requests, recommended when using one request per connection.",
+
+			FLAG flag_jsonrpc_experimental: (bool) = false, or |c: &Config| c.rpc.as_ref()?.experimental_rpcs.clone(),
+			"--jsonrpc-experimental",
+			"Enable experimental RPCs. Enable to have access to methods from unfinalised EIPs in all namespaces",
 
 			ARG arg_jsonrpc_port: (u16) = 8545u16, or |c: &Config| c.rpc.as_ref()?.port.clone(),
 			"--jsonrpc-port=[PORT]",
@@ -479,7 +498,7 @@ usage! {
 			"--jsonrpc-interface=[IP]",
 			"Specify the hostname portion of the HTTP JSON-RPC API server, IP should be an interface's IP address, or all (all interfaces) or local.",
 
-			ARG arg_jsonrpc_apis: (String) = "web3,eth,pubsub,net,parity,private,parity_pubsub,traces,rpc,shh,shh_pubsub", or |c: &Config| c.rpc.as_ref()?.apis.as_ref().map(|vec| vec.join(",")),
+			ARG arg_jsonrpc_apis: (String) = "web3,eth,pubsub,net,parity,private,parity_pubsub,traces,rpc,shh,shh_pubsub,parity_transactions_pool", or |c: &Config| c.rpc.as_ref()?.apis.as_ref().map(|vec| vec.join(",")),
 			"--jsonrpc-apis=[APIS]",
 			"Specify the APIs available through the HTTP JSON-RPC interface using a comma-delimited list of API names. Possible names are: all, safe, debug, web3, net, eth, pubsub, personal, signer, parity, parity_pubsub, parity_accounts, parity_set, traces, rpc, secretstore, shh, shh_pubsub. You can also disable a specific API by putting '-' in the front, example: all,-personal. 'safe' enables the following APIs: web3, net, eth, pubsub, parity, parity_pubsub, traces, rpc, shh, shh_pubsub",
 
@@ -503,6 +522,10 @@ usage! {
 			"--jsonrpc-max-payload=[MB]",
 			"Specify maximum size for HTTP JSON-RPC requests in megabytes.",
 
+			ARG arg_poll_lifetime: (u32) = 60u32, or |c: &Config| c.rpc.as_ref()?.poll_lifetime.clone(),
+			"--poll-lifetime=[S]",
+			"Set the RPC filter lifetime to S seconds. The filter has to be polled at least every S seconds , otherwise it is removed.",
+
 		["API and Console Options – WebSockets"]
 			FLAG flag_no_ws: (bool) = false, or |c: &Config| c.websockets.as_ref()?.disable.clone(),
 			"--no-ws",
@@ -516,7 +539,7 @@ usage! {
 			"--ws-interface=[IP]",
 			"Specify the hostname portion of the WebSockets JSON-RPC server, IP should be an interface's IP address, or all (all interfaces) or local.",
 
-			ARG arg_ws_apis: (String) = "web3,eth,pubsub,net,parity,parity_pubsub,private,traces,rpc,shh,shh_pubsub", or |c: &Config| c.websockets.as_ref()?.apis.as_ref().map(|vec| vec.join(",")),
+			ARG arg_ws_apis: (String) = "web3,eth,pubsub,net,parity,parity_pubsub,private,traces,rpc,shh,shh_pubsub,parity_transactions_pool", or |c: &Config| c.websockets.as_ref()?.apis.as_ref().map(|vec| vec.join(",")),
 			"--ws-apis=[APIS]",
 			"Specify the JSON-RPC APIs available through the WebSockets interface using a comma-delimited list of API names. Possible names are: all, safe, web3, net, eth, pubsub, personal, signer, parity, parity_pubsub, parity_accounts, parity_set, traces, rpc, secretstore, shh, shh_pubsub. You can also disable a specific API by putting '-' in the front, example: all,-personal. 'safe' enables the following APIs: web3, net, eth, pubsub, parity, parity_pubsub, traces, rpc, shh, shh_pubsub",
 
@@ -541,7 +564,7 @@ usage! {
 			"--ipc-path=[PATH]",
 			"Specify custom path for JSON-RPC over IPC service.",
 
-			ARG arg_ipc_apis: (String) = "web3,eth,pubsub,net,parity,parity_pubsub,parity_accounts,private,traces,rpc,shh,shh_pubsub", or |c: &Config| c.ipc.as_ref()?.apis.as_ref().map(|vec| vec.join(",")),
+			ARG arg_ipc_apis: (String) = "web3,eth,pubsub,net,parity,parity_pubsub,parity_accounts,private,traces,rpc,shh,shh_pubsub,parity_transactions_pool", or |c: &Config| c.ipc.as_ref()?.apis.as_ref().map(|vec| vec.join(",")),
 			"--ipc-apis=[APIS]",
 			"Specify custom API set available via JSON-RPC over IPC using a comma-delimited list of API names. Possible names are: all, safe, web3, net, eth, pubsub, personal, signer, parity, parity_pubsub, parity_accounts, parity_set, traces, rpc, secretstore, shh, shh_pubsub. You can also disable a specific API by putting '-' in the front, example: all,-personal. 'safe' enables the following APIs: web3, net, eth, pubsub, parity, parity_pubsub, traces, rpc, shh, shh_pubsub",
 
@@ -567,13 +590,25 @@ usage! {
 			"Specify CORS header for IPFS API responses. Special options: \"all\", \"none\".",
 
 		["Light Client Options"]
-			ARG arg_on_demand_retry_count: (Option<usize>) = None, or |c: &Config| c.light.as_ref()?.on_demand_retry_count,
-			"--on-demand-retry-count=[RETRIES]",
-			"Specify the query retry count.",
+			ARG arg_on_demand_response_time_window: (Option<u64>) = None, or |c: &Config| c.light.as_ref()?.on_demand_response_time_window,
+			"--on-demand-time-window=[S]",
+			"Specify the maximum time to wait for a successful response",
 
-			ARG arg_on_demand_inactive_time_limit: (Option<u64>) = None, or |c: &Config| c.light.as_ref()?.on_demand_inactive_time_limit,
-			"--on-demand-inactive-time-limit=[MS]",
-			"Specify light client query inactive time limit. O for no limit.",
+			ARG arg_on_demand_request_backoff_start: (Option<u64>) = None, or |c: &Config| c.light.as_ref()?.on_demand_request_backoff_start,
+			"--on-demand-start-backoff=[S]",
+			"Specify light client initial backoff time for a request",
+
+			ARG arg_on_demand_request_backoff_max: (Option<u64>) = None, or |c: &Config| c.light.as_ref()?.on_demand_request_backoff_max,
+			"--on-demand-end-backoff=[S]",
+			"Specify light client maximum backoff time for a request",
+
+			ARG arg_on_demand_request_backoff_rounds_max: (Option<usize>) = None, or |c: &Config| c.light.as_ref()?.on_demand_request_backoff_rounds_max,
+			"--on-demand-max-backoff-rounds=[TIMES]",
+			"Specify light client maximum number of backoff iterations for a request",
+
+			ARG arg_on_demand_request_consecutive_failures: (Option<usize>) = None, or |c: &Config| c.light.as_ref()?.on_demand_request_consecutive_failures,
+			"--on-demand-consecutive-failures=[TIMES]",
+			"Specify light client the number of failures for a request until it gets exponentially backed off",
 
 		["Secret Store Options"]
 			FLAG flag_no_secretstore: (bool) = false, or |c: &Config| c.secretstore.as_ref()?.disable.clone(),
@@ -587,6 +622,10 @@ usage! {
 			FLAG flag_no_secretstore_auto_migrate: (bool) = false, or |c: &Config| c.secretstore.as_ref()?.disable_auto_migrate.clone(),
 			"--no-secretstore-auto-migrate",
 			"Do not run servers set change session automatically when servers set changes. This option has no effect when servers set is read from configuration file.",
+
+			ARG arg_secretstore_http_cors: (String) = "none", or |c: &Config| c.secretstore.as_ref()?.cors.as_ref().map(|vec| vec.join(",")),
+			"--secretstore-http-cors=[URL]",
+			"Specify CORS header for Secret Store HTTP API responses. Special options: \"all\", \"none\".",
 
 			ARG arg_secretstore_acl_contract: (Option<String>) = Some("registry".into()), or |c: &Config| c.secretstore.as_ref()?.acl_contract.clone(),
 			"--secretstore-acl-contract=[SOURCE]",
@@ -681,7 +720,9 @@ usage! {
 			"--no-persistent-txqueue",
 			"Don't save pending local transactions to disk to be restored whenever the node restarts.",
 
-			FLAG flag_stratum: (bool) = false, or |c: &Config| Some(c.stratum.is_some()),
+			// For backward compatibility; Stratum should be enabled if the config file
+			// contains a `[stratum]` section and it is not explicitly disabled (disable = true)
+			FLAG flag_stratum: (bool) = false, or |c: &Config| Some(c.stratum.as_ref().map(|s| s.disable != Some(true)).unwrap_or(false)),
 			"--stratum",
 			"Run Stratum server for miner push notification.",
 
@@ -737,6 +778,10 @@ usage! {
 			"--tx-queue-per-sender=[LIMIT]",
 			"Maximum number of transactions per sender in the queue. By default it's 1% of the entire queue, but not less than 16.",
 
+			ARG arg_tx_queue_locals: (Option<String>) = None, or |c: &Config| helpers::join_set(c.mining.as_ref()?.tx_queue_locals.as_ref()),
+			"--tx-queue-locals=[ACCOUNTS]",
+			"Specify local accounts for which transactions are prioritized in the queue. ACCOUNTS is a comma-delimited list of addresses.",
+
 			ARG arg_tx_queue_strategy: (String) = "gas_price", or |c: &Config| c.mining.as_ref()?.tx_queue_strategy.clone(),
 			"--tx-queue-strategy=[S]",
 			"Prioritization strategy used to order transactions in the queue. S may be: gas_price - Prioritize txs with high gas price",
@@ -756,10 +801,6 @@ usage! {
 			ARG arg_gas_price_percentile: (usize) = 50usize, or |c: &Config| c.mining.as_ref()?.gas_price_percentile,
 			"--gas-price-percentile=[PCT]",
 			"Set PCT percentile gas price value from last 100 blocks as default gas price when sending transactions.",
-
-			ARG arg_poll_lifetime: (u32) = 60u32, or |c: &Config| c.mining.as_ref()?.poll_lifetime.clone(),
-			"--poll-lifetime=[S]",
-			"Set the lifetime of the internal index filter to S seconds.",
 
 			ARG arg_author: (Option<String>) = None, or |c: &Config| c.mining.as_ref()?.author.clone(),
 			"--author=[ADDRESS]",
@@ -880,7 +921,7 @@ usage! {
 		["Snapshot Options"]
 			FLAG flag_no_periodic_snapshot: (bool) = false, or |c: &Config| c.snapshots.as_ref()?.disable_periodic.clone(),
 			"--no-periodic-snapshot",
-			"Disable automated snapshots which usually occur once every 10000 blocks.",
+			"Disable automated snapshots which usually occur once every 5000 blocks.",
 
 			ARG arg_snapshot_threads: (Option<usize>) = None, or |c: &Config| c.snapshots.as_ref()?.processing_threads,
 			"--snapshot-threads=[NUM]",
@@ -891,7 +932,7 @@ usage! {
 			"--whisper",
 			"Enable the Whisper network.",
 
- 			ARG arg_whisper_pool_size: (usize) = 10usize, or |c: &Config| c.whisper.as_ref()?.pool_size.clone(),
+			ARG arg_whisper_pool_size: (usize) = 10usize, or |c: &Config| c.whisper.as_ref()?.pool_size.clone(),
 			"--whisper-pool-size=[MB]",
 			"Target size of the whisper message pool in megabytes.",
 
@@ -1224,6 +1265,9 @@ struct Rpc {
 	processing_threads: Option<usize>,
 	max_payload: Option<usize>,
 	keep_alive: Option<bool>,
+	experimental_rpcs: Option<bool>,
+	poll_lifetime: Option<u32>,
+	allow_missing_blocks: Option<bool>,
 }
 
 #[derive(Default, Debug, PartialEq, Deserialize)]
@@ -1288,6 +1332,7 @@ struct SecretStore {
 	http_interface: Option<String>,
 	http_port: Option<u16>,
 	path: Option<String>,
+	cors: Option<Vec<String>>
 }
 
 #[derive(Default, Debug, PartialEq, Deserialize)]
@@ -1316,7 +1361,6 @@ struct Mining {
 	relay_set: Option<String>,
 	min_gas_price: Option<u64>,
 	gas_price_percentile: Option<usize>,
-	poll_lifetime: Option<u32>,
 	usd_per_tx: Option<String>,
 	usd_per_eth: Option<String>,
 	price_update_period: Option<String>,
@@ -1326,6 +1370,7 @@ struct Mining {
 	tx_queue_size: Option<usize>,
 	tx_queue_per_sender: Option<usize>,
 	tx_queue_mem_limit: Option<u32>,
+	tx_queue_locals: Option<HashSet<String>>,
 	tx_queue_strategy: Option<String>,
 	tx_queue_ban_count: Option<u16>,
 	tx_queue_ban_time: Option<u16>,
@@ -1341,6 +1386,7 @@ struct Mining {
 #[derive(Default, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stratum {
+	disable: Option<bool>,
 	interface: Option<String>,
 	port: Option<u16>,
 	secret: Option<String>,
@@ -1392,8 +1438,11 @@ struct Whisper {
 #[derive(Default, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Light {
-	on_demand_retry_count: Option<usize>,
-	on_demand_inactive_time_limit: Option<u64>,
+	on_demand_response_time_window: Option<u64>,
+	on_demand_request_backoff_start: Option<u64>,
+	on_demand_request_backoff_max: Option<u64>,
+	on_demand_request_backoff_rounds_max: Option<usize>,
+	on_demand_request_consecutive_failures: Option<usize>,
 }
 
 #[cfg(test)]
@@ -1555,6 +1604,83 @@ mod tests {
 	}
 
 	#[test]
+	fn should_disable_stratum() {
+		// given
+		let config = toml::from_str(include_str!("./tests/config.stratum_disabled.toml")).unwrap();
+
+		// when
+		let args = Args::parse_with_config(&["parity"], config).unwrap();
+
+		// then
+		assert_eq!(args.flag_stratum, false);
+		assert_eq!(args.arg_stratum_interface, "local".to_owned());
+		assert_eq!(args.arg_stratum_port, 8008u16);
+		assert_eq!(args.arg_stratum_secret, None);
+	}
+
+	#[test]
+	fn should_disable_stratum_when_missing_section() {
+		// given
+		let config = toml::from_str(include_str!("./tests/config.stratum_missing_section.toml")).unwrap();
+
+		// when
+		let args = Args::parse_with_config(&["parity"], config).unwrap();
+
+		// then
+		assert_eq!(args.flag_stratum, false);
+		assert_eq!(args.arg_stratum_interface, "local".to_owned());
+		assert_eq!(args.arg_stratum_port, 8008u16);
+		assert_eq!(args.arg_stratum_secret, None);
+	}
+
+	#[test]
+	fn should_enable_stratum() {
+		// given
+		let config = toml::from_str(include_str!("./tests/config.stratum_enabled.toml")).unwrap();
+
+		// when
+		let args = Args::parse_with_config(&["parity"], config).unwrap();
+
+		// then (with custom configurations)
+		assert_eq!(args.flag_stratum, true);
+		assert_eq!(args.arg_stratum_interface, "some_interface".to_owned());
+		assert_eq!(args.arg_stratum_port, 8007u16);
+		assert_eq!(args.arg_stratum_secret, Some("Yellow".to_owned()));
+	}
+
+	#[test]
+	fn should_enable_stratum_by_param() {
+		// given
+		let config = toml::from_str(include_str!("./tests/config.full.toml")).unwrap();
+
+		// when
+		let args = Args::parse_with_config(&["parity", "--stratum"], config).unwrap();
+
+		// then
+		assert_eq!(args.flag_stratum, true);
+		assert_eq!(args.arg_stratum_interface, "local".to_owned());
+		assert_eq!(args.arg_stratum_port, 8008u16);
+		assert_eq!(args.arg_stratum_secret, None);
+	}
+
+	#[test]
+	// For backward compatibility; Stratum should be enabled if the config file
+	// contains a `[stratum]` section and it is not explicitly disabled (disable = true)
+	fn should_enable_stratum_when_missing_field() {
+		// given
+		let config = toml::from_str(include_str!("./tests/config.stratum_missing_field.toml")).unwrap();
+
+		// when
+		let args = Args::parse_with_config(&["parity"], config).unwrap();
+
+		// then
+		assert_eq!(args.flag_stratum, true);
+		assert_eq!(args.arg_stratum_interface, "local".to_owned());
+		assert_eq!(args.arg_stratum_port, 8008u16);
+		assert_eq!(args.arg_stratum_secret, None);
+	}
+
+	#[test]
 	fn should_parse_full_config() {
 		// given
 		let config = toml::from_str(include_str!("./tests/config.full.toml")).unwrap();
@@ -1588,6 +1714,7 @@ mod tests {
 			cmd_tools_hash: false,
 			cmd_db: false,
 			cmd_db_kill: false,
+			cmd_db_reset: false,
 			cmd_export_hardcoded_sync: false,
 
 			// Arguments
@@ -1607,6 +1734,7 @@ mod tests {
 			arg_dapp_path: None,
 			arg_account_import_path: None,
 			arg_wallet_import_path: None,
+			arg_db_reset_num: 10,
 
 			// -- Operating Options
 			arg_mode: "last".into(),
@@ -1682,6 +1810,7 @@ mod tests {
 			// RPC
 			flag_no_jsonrpc: false,
 			flag_jsonrpc_no_keep_alive: false,
+			flag_jsonrpc_experimental: false,
 			arg_jsonrpc_port: 8545u16,
 			arg_jsonrpc_interface: "local".into(),
 			arg_jsonrpc_cors: "null".into(),
@@ -1690,6 +1819,8 @@ mod tests {
 			arg_jsonrpc_server_threads: None,
 			arg_jsonrpc_threads: 4,
 			arg_jsonrpc_max_payload: None,
+			arg_poll_lifetime: 60u32,
+			flag_jsonrpc_allow_missing_blocks: false,
 
 			// WS
 			flag_no_ws: false,
@@ -1728,6 +1859,7 @@ mod tests {
 			arg_secretstore_http_interface: "local".into(),
 			arg_secretstore_http_port: 8082u16,
 			arg_secretstore_path: "$HOME/.parity/secretstore".into(),
+			arg_secretstore_http_cors: "null".into(),
 
 			// IPFS
 			flag_ipfs_api: false,
@@ -1751,7 +1883,6 @@ mod tests {
 			arg_min_gas_price: Some(0u64),
 			arg_usd_per_tx: "0.0001".into(),
 			arg_gas_price_percentile: 50usize,
-			arg_poll_lifetime: 60u32,
 			arg_usd_per_eth: "auto".into(),
 			arg_price_update_period: "hourly".into(),
 			arg_gas_floor_target: "8000000".into(),
@@ -1762,6 +1893,7 @@ mod tests {
 			arg_tx_queue_size: 8192usize,
 			arg_tx_queue_per_sender: None,
 			arg_tx_queue_mem_limit: 4u32,
+			arg_tx_queue_locals: Some("0xdeadbeefcafe0000000000000000000000000000".into()),
 			arg_tx_queue_strategy: "gas_factor".into(),
 			arg_tx_queue_ban_count: Some(1u16),
 			arg_tx_queue_ban_time: Some(180u16),
@@ -1808,8 +1940,11 @@ mod tests {
 			arg_snapshot_threads: None,
 
 			// -- Light options.
-			arg_on_demand_retry_count: Some(15),
-			arg_on_demand_inactive_time_limit: Some(15000),
+			arg_on_demand_response_time_window: Some(2),
+			arg_on_demand_request_backoff_start: Some(9),
+			arg_on_demand_request_backoff_max: Some(15),
+			arg_on_demand_request_backoff_rounds_max: Some(100),
+			arg_on_demand_request_consecutive_failures: Some(1),
 
 			// -- Whisper options.
 			flag_whisper: false,
@@ -1965,6 +2100,9 @@ mod tests {
 				processing_threads: None,
 				max_payload: None,
 				keep_alive: None,
+				experimental_rpcs: None,
+				poll_lifetime: None,
+				allow_missing_blocks: None
 			}),
 			ipc: Some(Ipc {
 				disable: None,
@@ -2000,6 +2138,7 @@ mod tests {
 				http_interface: None,
 				http_port: Some(8082),
 				path: None,
+				cors: None,
 			}),
 			private_tx: None,
 			ipfs: Some(Ipfs {
@@ -2021,7 +2160,6 @@ mod tests {
 				relay_set: None,
 				min_gas_price: None,
 				gas_price_percentile: None,
-				poll_lifetime: None,
 				usd_per_tx: None,
 				usd_per_eth: None,
 				price_update_period: Some("hourly".into()),
@@ -2030,6 +2168,7 @@ mod tests {
 				tx_queue_size: Some(8192),
 				tx_queue_per_sender: None,
 				tx_queue_mem_limit: None,
+				tx_queue_locals: None,
 				tx_queue_strategy: None,
 				tx_queue_ban_count: None,
 				tx_queue_ban_time: None,
@@ -2061,8 +2200,11 @@ mod tests {
 				num_verifiers: None,
 			}),
 			light: Some(Light {
-				on_demand_retry_count: Some(12),
-				on_demand_inactive_time_limit: Some(20000),
+				on_demand_response_time_window: Some(2),
+				on_demand_request_backoff_start: Some(9),
+				on_demand_request_backoff_max: Some(15),
+				on_demand_request_backoff_rounds_max: Some(10),
+				on_demand_request_consecutive_failures: Some(1),
 			}),
 			snapshots: Some(Snapshots {
 				disable_periodic: Some(true),

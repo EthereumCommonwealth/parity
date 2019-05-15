@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Parity-specific metadata extractors.
 
@@ -41,8 +41,8 @@ impl HttpMetaExtractor for RpcExtractor {
 		Metadata {
 			origin: Origin::Rpc(
 				format!("{} / {}",
-						origin.unwrap_or("unknown origin".to_string()),
-						user_agent.unwrap_or("unknown agent".to_string()))
+						origin.unwrap_or_else(|| "unknown origin".to_string()),
+						user_agent.unwrap_or_else(|| "unknown agent".to_string()))
 			),
 			session: None,
 		}
@@ -67,7 +67,7 @@ impl WsExtractor {
 	/// Creates new `WsExtractor` with given authcodes path.
 	pub fn new(path: Option<&Path>) -> Self {
 		WsExtractor {
-			authcodes_path: path.map(|p| p.to_owned()),
+			authcodes_path: path.map(ToOwned::to_owned),
 		}
 	}
 }
@@ -80,7 +80,7 @@ impl ws::MetaExtractor<Metadata> for WsExtractor {
 			Some(ref path) => {
 				let authorization = req.protocols.get(0).and_then(|p| auth_token_hash(&path, p, true));
 				match authorization {
-					Some(id) => Origin::Signer { session: id.into() },
+					Some(id) => Origin::Signer { session: id },
 					None => Origin::Ws { session: id.into() },
 				}
 			},
@@ -98,17 +98,16 @@ impl ws::RequestMiddleware for WsExtractor {
 	fn process(&self, req: &ws::ws::Request) -> ws::MiddlewareAction {
 		use self::ws::ws::Response;
 
-		// Reply with 200 Ok to HEAD requests.
+		// Reply with 200 OK to HEAD requests.
 		if req.method() == "HEAD" {
-			let mut response = Response::new(200, "Ok");
+			let mut response = Response::new(200, "OK", vec![]);
 			add_security_headers(&mut response);
 			return Some(response).into();
 		}
 
 		// Display WS info.
 		if req.header("sec-websocket-key").is_none() {
-			let mut response = Response::new(200, "Ok");
-			response.set_body("WebSocket interface is active. Open WS connection to access RPC.");
+			let mut response = Response::new(200, "OK", b"WebSocket interface is active. Open WS connection to access RPC.".to_vec());
 			add_security_headers(&mut response);
 			return Some(response).into();
 		}
@@ -123,7 +122,7 @@ impl ws::RequestMiddleware for WsExtractor {
 						"Blocked connection from {} using invalid token.",
 						req.header("origin").and_then(|e| ::std::str::from_utf8(e).ok()).unwrap_or("Unknown Origin")
 					);
-					let mut response = Response::new(403, "Forbidden");
+					let mut response = Response::new(403, "Forbidden", vec![]);
 					add_security_headers(&mut response);
 					return Some(response).into();
 				}
@@ -187,7 +186,7 @@ impl WsStats {
 	/// Creates new WS usage tracker.
 	pub fn new(stats: Arc<RpcStats>) -> Self {
 		WsStats {
-			stats: stats,
+			stats,
 		}
 	}
 }
@@ -211,7 +210,7 @@ impl<M: core::Middleware<Metadata>> WsDispatcher<M> {
 	/// Create new `WsDispatcher` with given full handler.
 	pub fn new(full_handler: core::MetaIoHandler<Metadata, M>) -> Self {
 		WsDispatcher {
-			full_handler: full_handler,
+			full_handler,
 		}
 	}
 }
@@ -230,7 +229,7 @@ impl<M: core::Middleware<Metadata>> core::Middleware<Metadata> for WsDispatcher<
 		X: core::futures::Future<Item=Option<core::Response>, Error=()> + Send + 'static,
 	{
 		let use_full = match &meta.origin {
-			&Origin::Signer { .. } => true,
+			Origin::Signer { .. } => true,
 			_ => false,
 		};
 

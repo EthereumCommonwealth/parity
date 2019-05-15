@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Parameters for a block chain.
 
@@ -25,22 +25,22 @@ use bytes::Bytes;
 use ethereum_types::{H256, Bloom, U256, Address};
 use ethjson;
 use hash::{KECCAK_NULL_RLP, keccak};
-use memorydb::MemoryDB;
 use parking_lot::RwLock;
 use rlp::{Rlp, RlpStream};
 use rustc_hex::{FromHex, ToHex};
+use types::BlockNumber;
+use types::encoded;
+use types::header::Header;
 use vm::{EnvInfo, CallType, ActionValue, ActionParams, ParamsType};
 
 use builtin::Builtin;
-use encoded;
 use engines::{
-	EthEngine, NullEngine, InstantSeal, InstantSealParams, BasicAuthority,
-	AuthorityRound, Tendermint, DEFAULT_BLOCKHASH_CONTRACT
+	EthEngine, NullEngine, InstantSeal, InstantSealParams, BasicAuthority, Clique,
+	AuthorityRound, DEFAULT_BLOCKHASH_CONTRACT
 };
 use error::Error;
 use executive::Executive;
 use factory::Factories;
-use header::{BlockNumber, Header};
 use machine::EthereumMachine;
 use pod_state::PodState;
 use spec::Genesis;
@@ -99,9 +99,9 @@ pub struct CommonParams {
 	pub validate_receipts_transition: BlockNumber,
 	/// Validate transaction chain id.
 	pub validate_chain_id_transition: BlockNumber,
-	/// Number of first block where EIP-140 (Metropolis: REVERT opcode) rules begin.
+	/// Number of first block where EIP-140 rules begin.
 	pub eip140_transition: BlockNumber,
-	/// Number of first block where EIP-210 (Metropolis: BLOCKHASH changes) rules begin.
+	/// Number of first block where EIP-210 rules begin.
 	pub eip210_transition: BlockNumber,
 	/// EIP-210 Blockhash contract address.
 	pub eip210_contract_address: Address,
@@ -109,8 +109,7 @@ pub struct CommonParams {
 	pub eip210_contract_code: Bytes,
 	/// Gas allocated for EIP-210 blockhash update.
 	pub eip210_contract_gas: U256,
-	/// Number of first block where EIP-211 (Metropolis: RETURNDATASIZE/RETURNDATACOPY) rules
-	/// begin.
+	/// Number of first block where EIP-211 rules begin.
 	pub eip211_transition: BlockNumber,
 	/// Number of first block where EIP-214 rules begin.
 	pub eip214_transition: BlockNumber,
@@ -120,6 +119,8 @@ pub struct CommonParams {
 	pub eip1052_transition: BlockNumber,
 	/// Number of first block where EIP-1283 rules begin.
 	pub eip1283_transition: BlockNumber,
+	/// Number of first block where EIP-1283 rules end.
+	pub eip1283_disable_transition: BlockNumber,
 	/// Number of first block where EIP-1014 rules begin.
 	pub eip1014_transition: BlockNumber,
 	/// Number of first block where dust cleanup rules (EIP-168 and EIP169) begin.
@@ -188,7 +189,7 @@ impl CommonParams {
 		schedule.have_return_data = block_number >= self.eip211_transition;
 		schedule.have_bitwise_shifting = block_number >= self.eip145_transition;
 		schedule.have_extcodehash = block_number >= self.eip1052_transition;
-		schedule.eip1283 = block_number >= self.eip1283_transition;
+		schedule.eip1283 = block_number >= self.eip1283_transition && !(block_number >= self.eip1283_disable_transition);
 		if block_number >= self.eip210_transition {
 			schedule.blockhash_gas = 800;
 		}
@@ -250,7 +251,10 @@ impl From<ethjson::spec::Params> for CommonParams {
 			eip160_transition: p.eip160_transition.map_or(0, Into::into),
 			eip161abc_transition: p.eip161abc_transition.map_or(0, Into::into),
 			eip161d_transition: p.eip161d_transition.map_or(0, Into::into),
-			eip98_transition: p.eip98_transition.map_or(0, Into::into),
+			eip98_transition: p.eip98_transition.map_or_else(
+				BlockNumber::max_value,
+				Into::into,
+			),
 			eip155_transition: p.eip155_transition.map_or(0, Into::into),
 			validate_receipts_transition: p.validate_receipts_transition.map_or(0, Into::into),
 			validate_chain_id_transition: p.validate_chain_id_transition.map_or(0, Into::into),
@@ -293,6 +297,10 @@ impl From<ethjson::spec::Params> for CommonParams {
 				Into::into,
 			),
 			eip1283_transition: p.eip1283_transition.map_or_else(
+				BlockNumber::max_value,
+				Into::into,
+			),
+			eip1283_disable_transition: p.eip1283_disable_transition.map_or_else(
 				BlockNumber::max_value,
 				Into::into,
 			),
@@ -506,7 +514,7 @@ fn load_from(spec_params: SpecParams, s: ethjson::spec::Spec) -> Result<Spec, Er
 				chts: s.hardcoded_sync
 					.as_ref()
 					.map(|s| s.chts.iter().map(|c| c.clone().into()).collect())
-					.unwrap_or(Vec::new()),
+					.unwrap_or_default()
 			})
 		} else {
 			None
@@ -546,7 +554,7 @@ fn load_from(spec_params: SpecParams, s: ethjson::spec::Spec) -> Result<Spec, Er
 		None => {
 			let _ = s.run_constructors(
 				&Default::default(),
-				BasicBackend(MemoryDB::new()),
+				BasicBackend(journaldb::new_memory_db()),
 			)?;
 		}
 	}
@@ -602,10 +610,10 @@ impl Spec {
 			ethjson::spec::Engine::InstantSeal(Some(instant_seal)) => Arc::new(InstantSeal::new(instant_seal.params.into(), machine)),
 			ethjson::spec::Engine::InstantSeal(None) => Arc::new(InstantSeal::new(InstantSealParams::default(), machine)),
 			ethjson::spec::Engine::BasicAuthority(basic_authority) => Arc::new(BasicAuthority::new(basic_authority.params.into(), machine)),
+			ethjson::spec::Engine::Clique(clique) => Clique::new(clique.params.into(), machine)
+								.expect("Failed to start Clique consensus engine."),
 			ethjson::spec::Engine::AuthorityRound(authority_round) => AuthorityRound::new(authority_round.params.into(), machine)
 				.expect("Failed to start AuthorityRound consensus engine."),
-			ethjson::spec::Engine::Tendermint(tendermint) => Tendermint::new(tendermint.params.into(), machine)
-				.expect("Failed to start the Tendermint consensus engine."),
 		}
 	}
 
@@ -616,7 +624,7 @@ impl Spec {
 
 		// basic accounts in spec.
 		{
-			let mut t = factories.trie.create(db.as_hashdb_mut(), &mut root);
+			let mut t = factories.trie.create(db.as_hash_db_mut(), &mut root);
 
 			for (address, account) in self.genesis_state.get().iter() {
 				t.insert(&**address, &account.rlp())?;
@@ -627,7 +635,7 @@ impl Spec {
 			db.note_non_null_account(address);
 			account.insert_additional(
 				&mut *factories.accountdb.create(
-					db.as_hashdb_mut(),
+					db.as_hash_db_mut(),
 					keccak(address),
 				),
 				&factories.trie,
@@ -784,7 +792,7 @@ impl Spec {
 		self.genesis_state = s;
 		let _ = self.run_constructors(
 			&Default::default(),
-			BasicBackend(MemoryDB::new()),
+			BasicBackend(journaldb::new_memory_db()),
 		)?;
 
 		Ok(())
@@ -805,7 +813,7 @@ impl Spec {
 
 	/// Ensure that the given state DB has the trie nodes in for the genesis state.
 	pub fn ensure_db_good<T: Backend>(&self, db: T, factories: &Factories) -> Result<T, Error> {
-		if db.as_hashdb().contains(&self.state_root()) {
+		if db.as_hash_db().contains(&self.state_root()) {
 			return Ok(db);
 		}
 
@@ -820,7 +828,6 @@ impl Spec {
 		ethjson::spec::Spec::load(reader)
 			.map_err(fmt_err)
 			.map(load_machine_from)
-
 	}
 
 	/// Loads spec from json file. Provide factories for executing contracts and ensuring
@@ -839,7 +846,7 @@ impl Spec {
 	/// initialize genesis epoch data, using in-memory database for
 	/// constructor.
 	pub fn genesis_epoch_data(&self) -> Result<Vec<u8>, String> {
-		use transaction::{Action, Transaction};
+		use types::transaction::{Action, Transaction};
 		use journaldb;
 		use kvdb_memorydb;
 
@@ -852,7 +859,7 @@ impl Spec {
 			None,
 		);
 
-		self.ensure_db_good(BasicBackend(db.as_hashdb_mut()), &factories)
+		self.ensure_db_good(BasicBackend(db.as_hash_db_mut()), &factories)
 			.map_err(|e| format!("Unable to initialize genesis state: {}", e))?;
 
 		let call = |a, d| {
@@ -878,7 +885,7 @@ impl Spec {
 			}.fake_sign(from);
 
 			let res = ::state::prove_transaction_virtual(
-				db.as_hashdb_mut(),
+				db.as_hash_db_mut(),
 				*genesis.state_root(),
 				&tx,
 				self.engine.machine(),
@@ -952,14 +959,6 @@ impl Spec {
 		load_bundled!("authority_round_block_reward_contract")
 	}
 
-	/// Create a new Spec with Tendermint consensus which does internal sealing (not requiring
-	/// work).
-	/// Account keccak("0") and keccak("1") are a authorities.
-	#[cfg(any(test, feature = "test-helpers"))]
-	pub fn new_test_tendermint() -> Self {
-		load_bundled!("tendermint")
-	}
-
 	/// TestList.sol used in both specs: https://github.com/paritytech/contracts/pull/30/files
 	/// Accounts with secrets keccak("0") and keccak("1") are initially the validators.
 	/// Create a new Spec with BasicAuthority which uses a contract at address 5 to determine
@@ -996,10 +995,10 @@ mod tests {
 	use super::*;
 	use state::State;
 	use test_helpers::get_temp_state_db;
-	use views::BlockView;
 	use tempdir::TempDir;
+	use types::view;
+	use types::views::BlockView;
 
-	// https://github.com/paritytech/parity-ethereum/issues/1840
 	#[test]
 	fn test_load_empty() {
 		let tempdir = TempDir::new("").unwrap();
@@ -1023,7 +1022,7 @@ mod tests {
 
 	#[test]
 	fn genesis_constructor() {
-		::ethcore_logger::init_log();
+		let _ = ::env_logger::try_init();
 		let spec = Spec::new_test_constructor();
 		let db = spec.ensure_db_good(get_temp_state_db(), &Default::default())
 			.unwrap();

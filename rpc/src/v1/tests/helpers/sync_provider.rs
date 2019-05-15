@@ -1,25 +1,27 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Test implementation of SyncProvider.
 
 use std::collections::BTreeMap;
 use ethereum_types::H256;
 use parking_lot::RwLock;
-use sync::{SyncProvider, EthProtocolInfo, SyncStatus, SyncState, PeerInfo, TransactionStats};
+use network::client_version::ClientVersion;
+use futures::sync::mpsc;
+use sync::{SyncProvider, EthProtocolInfo, SyncStatus, PeerInfo, TransactionStats, SyncState};
 
 /// TestSyncProvider config.
 pub struct Config {
@@ -33,6 +35,8 @@ pub struct Config {
 pub struct TestSyncProvider {
 	/// Sync status.
 	pub status: RwLock<SyncStatus>,
+	/// is major importing?
+	is_importing: RwLock<bool>,
 }
 
 impl TestSyncProvider {
@@ -55,12 +59,14 @@ impl TestSyncProvider {
 				snapshot_chunks_done: 0,
 				last_imported_old_block_number: None,
 			}),
+			is_importing: RwLock::new(false)
 		}
 	}
 
 	/// Simulate importing blocks.
 	pub fn increase_imported_block_number(&self, count: u64) {
 		let mut status =  self.status.write();
+		*self.is_importing.write() = true;
 		let current_number = status.last_imported_block_number.unwrap_or(0);
 		status.last_imported_block_number = Some(current_number + count);
 	}
@@ -75,7 +81,7 @@ impl SyncProvider for TestSyncProvider {
 		vec![
 			PeerInfo {
 				id: Some("node1".to_owned()),
-				client_version: "Parity-Ethereum/1".to_owned(),
+				client_version: ClientVersion::from("Parity-Ethereum/1/v2.4.0/linux/rustc"),
 				capabilities: vec!["eth/62".to_owned(), "eth/63".to_owned()],
 				remote_address: "127.0.0.1:7777".to_owned(),
 				local_address: "127.0.0.1:8888".to_owned(),
@@ -88,7 +94,7 @@ impl SyncProvider for TestSyncProvider {
 			},
 			PeerInfo {
 				id: None,
-				client_version: "Parity-Ethereum/2".to_owned(),
+				client_version: ClientVersion::from("Parity-Ethereum/2/v2.4.0/linux/rustc"),
 				capabilities: vec!["eth/63".to_owned(), "eth/64".to_owned()],
 				remote_address: "Handshake".to_owned(),
 				local_address: "127.0.0.1:3333".to_owned(),
@@ -121,5 +127,18 @@ impl SyncProvider for TestSyncProvider {
 				],
 			}
 		]
+	}
+
+	fn sync_notification(&self) -> mpsc::UnboundedReceiver<SyncState> {
+		unimplemented!()
+	}
+
+	fn is_major_syncing(&self) -> bool {
+		match (self.status.read().state, *self.is_importing.read()) {
+			(SyncState::Idle, _) => false,
+			(SyncState::Blocks, _) => true,
+			(_, true) => true,
+			_ => false
+		}
 	}
 }

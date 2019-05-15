@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Light client synchronization.
 //!
@@ -34,23 +34,27 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 
-use ethcore::encoded;
+use types::encoded;
 use light::client::{AsLightClient, LightChainClient};
 use light::net::{
 	PeerStatus, Announcement, Handler, BasicContext,
 	EventContext, Capabilities, ReqId, Status,
 	Error as NetError,
 };
+use chain::SyncState as ChainSyncState;
 use light::request::{self, CompleteHeadersRequest as HeadersRequest};
 use network::PeerId;
 use ethereum_types::{H256, U256};
 use parking_lot::{Mutex, RwLock};
 use rand::{Rng, OsRng};
+use futures::sync::mpsc;
 
 use self::sync_round::{AbortReason, SyncRound, ResponseContext};
+use api::Notification;
 
 mod response;
 mod sync_round;
@@ -213,6 +217,44 @@ enum SyncState {
 	Rounds(SyncRound),
 }
 
+/// A wrapper around the SyncState that makes sure to
+/// update the giving reference to `is_idle`
+#[derive(Debug)]
+struct SyncStateWrapper {
+	state: SyncState,
+}
+
+impl SyncStateWrapper {
+	/// Create a new wrapper for SyncState::Idle
+	pub fn idle() -> Self {
+		SyncStateWrapper {
+			state: SyncState::Idle,
+		}
+	}
+
+	/// Set the new state's value, making sure `is_idle` gets updated
+	pub fn set(&mut self, state: SyncState, is_idle_handle: &mut bool) {
+		*is_idle_handle = match state {
+			SyncState::Idle => true,
+			_ => false,
+		};
+		self.state = state;
+	}
+
+	/// Returns the internal state's value
+	pub fn into_inner(self) -> SyncState {
+		self.state
+	}
+}
+
+impl Deref for SyncStateWrapper {
+	type Target = SyncState;
+
+	fn deref(&self) -> &SyncState {
+		&self.state
+	}
+}
+
 struct ResponseCtx<'a> {
 	peer: PeerId,
 	req_id: ReqId,
@@ -235,7 +277,10 @@ pub struct LightSync<L: AsLightClient> {
 	pending_reqs: Mutex<HashMap<ReqId, PendingReq>>, // requests from this handler
 	client: Arc<L>,
 	rng: Mutex<OsRng>,
-	state: Mutex<SyncState>,
+	state: Mutex<SyncStateWrapper>,
+	senders: RwLock<Vec<mpsc::UnboundedSender<ChainSyncState>>>,
+	// We duplicate this state tracking to avoid deadlocks in `is_major_importing`.
+	is_idle: Mutex<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,16 +354,17 @@ impl<L: AsLightClient + Send + Sync> Handler for LightSync<L> {
 
 		if new_best.is_none() {
 			debug!(target: "sync", "No peers remain. Reverting to idle");
-			*self.state.lock() = SyncState::Idle;
+			self.set_state(&mut self.state.lock(), SyncState::Idle);
 		} else {
 			let mut state = self.state.lock();
 
-			*state = match mem::replace(&mut *state, SyncState::Idle) {
+			let next_state = match mem::replace(&mut *state, SyncStateWrapper::idle()).into_inner() {
 				SyncState::Idle => SyncState::Idle,
 				SyncState::AncestorSearch(search) =>
 					SyncState::AncestorSearch(search.requests_abandoned(unfulfilled)),
 				SyncState::Rounds(round) => SyncState::Rounds(round.requests_abandoned(unfulfilled)),
 			};
+			self.set_state(&mut state, next_state);
 		}
 
 		self.maintain_sync(ctx.as_basic());
@@ -390,12 +436,13 @@ impl<L: AsLightClient + Send + Sync> Handler for LightSync<L> {
 				data: headers,
 			};
 
-			*state = match mem::replace(&mut *state, SyncState::Idle) {
+			let next_state = match mem::replace(&mut *state, SyncStateWrapper::idle()).into_inner() {
 				SyncState::Idle => SyncState::Idle,
 				SyncState::AncestorSearch(search) =>
 					SyncState::AncestorSearch(search.process_response(&ctx, &*self.client)),
 				SyncState::Rounds(round) => SyncState::Rounds(round.process_response(&ctx)),
 			};
+			self.set_state(&mut state, next_state);
 		}
 
 		self.maintain_sync(ctx.as_basic());
@@ -408,12 +455,30 @@ impl<L: AsLightClient + Send + Sync> Handler for LightSync<L> {
 
 // private helpers
 impl<L: AsLightClient> LightSync<L> {
+	/// Sets the LightSync's state, and update
+	/// `is_idle`
+	fn set_state(&self, state: &mut SyncStateWrapper, next_state: SyncState) {
+
+		match next_state {
+			SyncState::Idle => self.notify_senders(ChainSyncState::Idle),
+			_ => self.notify_senders(ChainSyncState::Blocks)
+		};
+
+		state.set(next_state, &mut self.is_idle.lock());
+	}
+
+	fn notify_senders(&self, state: ChainSyncState) {
+		self.senders.write().retain(|sender| {
+			sender.unbounded_send(state).is_ok()
+		})
+	}
+
 	// Begins a search for the common ancestor and our best block.
 	// does not lock state, instead has a mutable reference to it passed.
-	fn begin_search(&self, state: &mut SyncState) {
+	fn begin_search(&self, state: &mut SyncStateWrapper) {
 		if let None =  *self.best_seen.lock() {
 			// no peers.
-			*state = SyncState::Idle;
+			self.set_state(state, SyncState::Idle);
 			return;
 		}
 
@@ -422,12 +487,13 @@ impl<L: AsLightClient> LightSync<L> {
 
 		trace!(target: "sync", "Beginning search for common ancestor from {:?}",
 			(chain_info.best_block_number, chain_info.best_block_hash));
-		*state = SyncState::AncestorSearch(AncestorSearch::begin(chain_info.best_block_number));
+		let next_state = SyncState::AncestorSearch(AncestorSearch::begin(chain_info.best_block_number));
+		self.set_state(state, next_state);
 	}
 
 	// handles request dispatch, block import, state machine transitions, and timeouts.
 	fn maintain_sync(&self, ctx: &BasicContext) {
-		use ethcore::error::{Error as EthcoreError, ErrorKind as EthcoreErrorKind, ImportErrorKind};
+		use ethcore::error::{Error as EthcoreError, ImportError};
 
 		const DRAIN_AMOUNT: usize = 128;
 
@@ -435,7 +501,7 @@ impl<L: AsLightClient> LightSync<L> {
 		let chain_info = client.chain_info();
 
 		let mut state = self.state.lock();
-		debug!(target: "sync", "Maintaining sync ({:?})", &*state);
+		debug!(target: "sync", "Maintaining sync ({:?})", **state);
 
 		// drain any pending blocks into the queue.
 		{
@@ -445,11 +511,12 @@ impl<L: AsLightClient> LightSync<L> {
 			loop {
 				if client.queue_info().is_full() { break }
 
-				*state = match mem::replace(&mut *state, SyncState::Idle) {
+				let next_state = match mem::replace(&mut *state, SyncStateWrapper::idle()).into_inner() {
 					SyncState::Rounds(round)
 						=> SyncState::Rounds(round.drain(&mut sink, Some(DRAIN_AMOUNT))),
 					other => other,
 				};
+				self.set_state(&mut state, next_state);
 
 				if sink.is_empty() { break }
 				trace!(target: "sync", "Drained {} headers to import", sink.len());
@@ -457,10 +524,10 @@ impl<L: AsLightClient> LightSync<L> {
 				for header in sink.drain(..) {
 					match client.queue_header(header) {
 						Ok(_) => {}
-						Err(EthcoreError(EthcoreErrorKind::Import(ImportErrorKind::AlreadyInChain), _)) => {
+						Err(EthcoreError::Import(ImportError::AlreadyInChain)) => {
 							trace!(target: "sync", "Block already in chain. Continuing.");
 						},
-						Err(EthcoreError(EthcoreErrorKind::Import(ImportErrorKind::AlreadyQueued), _)) => {
+						Err(EthcoreError::Import(ImportError::AlreadyQueued)) => {
 							trace!(target: "sync", "Block already queued. Continuing.");
 						},
 						Err(e) => {
@@ -483,15 +550,15 @@ impl<L: AsLightClient> LightSync<L> {
 					let network_score = other.as_ref().map(|target| target.head_td);
 					trace!(target: "sync", "No target to sync to. Network score: {:?}, Local score: {:?}",
 						network_score, best_td);
-					*state = SyncState::Idle;
+					self.set_state(&mut state, SyncState::Idle);
 					return;
 				}
 			};
 
-			match mem::replace(&mut *state, SyncState::Idle) {
+			match mem::replace(&mut *state, SyncStateWrapper::idle()).into_inner() {
 				SyncState::Rounds(SyncRound::Abort(reason, remaining)) => {
 					if remaining.len() > 0 {
-						*state = SyncState::Rounds(SyncRound::Abort(reason, remaining));
+						self.set_state(&mut state, SyncState::Rounds(SyncRound::Abort(reason, remaining)));
 						return;
 					}
 
@@ -505,7 +572,7 @@ impl<L: AsLightClient> LightSync<L> {
 						AbortReason::NoResponses => {}
 						AbortReason::TargetReached => {
 							debug!(target: "sync", "Sync target reached. Going idle");
-							*state = SyncState::Idle;
+							self.set_state(&mut state, SyncState::Idle);
 							return;
 						}
 					}
@@ -514,15 +581,15 @@ impl<L: AsLightClient> LightSync<L> {
 					self.begin_search(&mut state);
 				}
 				SyncState::AncestorSearch(AncestorSearch::FoundCommon(num, hash)) => {
-					*state = SyncState::Rounds(SyncRound::begin((num, hash), sync_target));
+					self.set_state(&mut state, SyncState::Rounds(SyncRound::begin((num, hash), sync_target)));
 				}
 				SyncState::AncestorSearch(AncestorSearch::Genesis) => {
 					// Same here.
 					let g_hash = chain_info.genesis_hash;
-					*state = SyncState::Rounds(SyncRound::begin((0, g_hash), sync_target));
+					self.set_state(&mut state, SyncState::Rounds(SyncRound::begin((0, g_hash), sync_target)));
 				}
 				SyncState::Idle => self.begin_search(&mut state),
-				other => *state = other, // restore displaced state.
+				other => self.set_state(&mut state, other), // restore displaced state.
 			}
 		}
 
@@ -543,12 +610,13 @@ impl<L: AsLightClient> LightSync<L> {
 				}
 				drop(pending_reqs);
 
-				*state = match mem::replace(&mut *state, SyncState::Idle) {
+				let next_state = match mem::replace(&mut *state, SyncStateWrapper::idle()).into_inner() {
 					SyncState::Idle => SyncState::Idle,
 					SyncState::AncestorSearch(search) =>
 						SyncState::AncestorSearch(search.requests_abandoned(&unfulfilled)),
 					SyncState::Rounds(round) => SyncState::Rounds(round.requests_abandoned(&unfulfilled)),
 				};
+				self.set_state(&mut state, next_state);
 			}
 		}
 
@@ -605,35 +673,23 @@ impl<L: AsLightClient> LightSync<L> {
 				None
 			};
 
-			*state = match mem::replace(&mut *state, SyncState::Idle) {
+			let next_state = match mem::replace(&mut *state, SyncStateWrapper::idle()).into_inner() {
 				SyncState::Rounds(round) =>
 					SyncState::Rounds(round.dispatch_requests(dispatcher)),
 				SyncState::AncestorSearch(search) =>
 					SyncState::AncestorSearch(search.dispatch_request(dispatcher)),
 				other => other,
 			};
+			self.set_state(&mut state, next_state);
 		}
 	}
 
-	fn is_major_importing_do_wait(&self, wait: bool) -> bool {
-		const EMPTY_QUEUE: usize = 3;
-
-		if self.client.as_light_client().queue_info().unverified_queue_size > EMPTY_QUEUE {
-			return true;
-		}
-		let mg_state = if wait {
-			self.state.lock()
-		} else {
-			if let Some(mg_state) = self.state.try_lock() {
-				mg_state
-			} else {
-				return false;
-			}
-		};
-		match *mg_state {
-			SyncState::Idle => false,
-			_ => true,
-		}
+	// returns receiving end of futures::mpsc::unbounded channel
+	// poll the channel for changes to sync state.
+	fn sync_notification(&self) -> Notification<ChainSyncState> {
+		let (sender, receiver) = futures::sync::mpsc::unbounded();
+		self.senders.write().push(sender);
+		receiver
 	}
 }
 
@@ -651,7 +707,9 @@ impl<L: AsLightClient> LightSync<L> {
 			pending_reqs: Mutex::new(HashMap::new()),
 			client: client,
 			rng: Mutex::new(OsRng::new()?),
-			state: Mutex::new(SyncState::Idle),
+			senders: RwLock::new(Vec::new()),
+			state: Mutex::new(SyncStateWrapper::idle()),
+			is_idle: Mutex::new(true),
 		})
 	}
 }
@@ -667,8 +725,9 @@ pub trait SyncInfo {
 	/// Whether major sync is underway.
 	fn is_major_importing(&self) -> bool;
 
-	/// Whether major sync is underway, skipping some synchronization.
-	fn is_major_importing_no_sync(&self) -> bool;
+	/// returns the receieving end of a futures::mpsc unbounded channel
+	/// poll the channel for changes to sync state
+	fn sync_notification(&self) -> Notification<ChainSyncState>;
 }
 
 impl<L: AsLightClient> SyncInfo for LightSync<L> {
@@ -681,11 +740,16 @@ impl<L: AsLightClient> SyncInfo for LightSync<L> {
 	}
 
 	fn is_major_importing(&self) -> bool {
-		self.is_major_importing_do_wait(true)
+		const EMPTY_QUEUE: usize = 3;
+
+		let queue_info = self.client.as_light_client().queue_info();
+		let is_verifying = queue_info.unverified_queue_size + queue_info.verified_queue_size > EMPTY_QUEUE;
+		let is_syncing = !*self.is_idle.lock();
+
+		is_verifying || is_syncing
 	}
 
-	fn is_major_importing_no_sync(&self) -> bool {
-		self.is_major_importing_do_wait(false)
+	fn sync_notification(&self) -> Notification<ChainSyncState> {
+		self.sync_notification()
 	}
-
 }

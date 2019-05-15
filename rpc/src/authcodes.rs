@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -51,7 +51,7 @@ const TIME_THRESHOLD: u64 = 7;
 /// minimal length of hash
 const TOKEN_LENGTH: usize = 16;
 /// Separator between fields in serialized tokens file.
-const SEPARATOR: &'static str = ";";
+const SEPARATOR: &str = ";";
 /// Number of seconds to keep unused tokens.
 const UNUSED_TOKEN_TIMEOUT: u64 = 3600 * 24; // a day
 
@@ -115,7 +115,7 @@ impl AuthCodes<DefaultTimeProvider> {
 			})
 			.collect();
 		Ok(AuthCodes {
-			codes: codes,
+			codes,
 			now: time_provider,
 		})
 	}
@@ -128,7 +128,7 @@ impl<T: TimeProvider> AuthCodes<T> {
 	pub fn to_file(&self, file: &Path) -> io::Result<()> {
 		let mut file = fs::File::create(file)?;
 		let content = self.codes.iter().map(|code| {
-			let mut data = vec![code.code.clone(), encode_time(code.created_at.clone())];
+			let mut data = vec![code.code.clone(), encode_time(code.created_at)];
 			if let Some(used_at) = code.last_used_at {
 				data.push(encode_time(used_at));
 			}
@@ -141,11 +141,11 @@ impl<T: TimeProvider> AuthCodes<T> {
 	pub fn new(codes: Vec<String>, now: T) -> Self {
 		AuthCodes {
 			codes: codes.into_iter().map(|code| Code {
-				code: code,
+				code,
 				created_at: time::Duration::from_secs(now.now()),
 				last_used_at: None,
 			}).collect(),
-			now: now,
+			now,
 		}
 	}
 
@@ -183,7 +183,7 @@ impl<T: TimeProvider> AuthCodes<T> {
 			.join("-");
 		trace!(target: "signer", "New authentication token generated.");
 		self.codes.push(Code {
-			code: code,
+			code,
 			created_at: time::Duration::from_secs(self.now.now()),
 			last_used_at: None,
 		});

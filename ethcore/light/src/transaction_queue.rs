@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Light Transaction Queue.
 //!
@@ -24,12 +24,15 @@
 //! address-wise manner.
 
 use std::fmt;
+use std::sync::Arc;
 use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::Entry;
 
-use transaction::{self, Condition, PendingTransaction, SignedTransaction};
+use common_types::transaction::{self, Condition, PendingTransaction, SignedTransaction};
 use ethereum_types::{H256, U256, Address};
 use fastmap::H256FastMap;
+use futures::sync::mpsc;
+use miner::pool::TxStatus;
 
 // Knowledge of an account's current nonce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +98,7 @@ impl AccountTransactions {
 	}
 
 	fn next_nonce(&self) -> U256 {
-		self.current.last().map(|last| last.nonce + 1)
+		self.current.last().map(|last| last.nonce.saturating_add(1.into()))
 			.unwrap_or_else(|| *self.cur_nonce.value())
 	}
 
@@ -107,7 +110,7 @@ impl AccountTransactions {
 		while let Some(tx) = self.future.remove(&next_nonce) {
 			promoted.push(tx.hash);
 			self.current.push(tx);
-			next_nonce = next_nonce + 1;
+			next_nonce = next_nonce.saturating_add(1.into());
 		}
 
 		promoted
@@ -134,6 +137,7 @@ pub struct TransactionQueue {
 	by_account: HashMap<Address, AccountTransactions>,
 	by_hash: H256FastMap<PendingTransaction>,
 	listeners: Vec<Listener>,
+	tx_statuses_listeners: Vec<mpsc::UnboundedSender<Arc<Vec<(H256, TxStatus)>>>>,
 }
 
 impl fmt::Debug for TransactionQueue {
@@ -231,7 +235,7 @@ impl TransactionQueue {
 		};
 
 		self.by_hash.insert(hash, tx);
-		self.notify(&promoted);
+		self.notify(&promoted, TxStatus::Added);
 		Ok(res)
 	}
 
@@ -343,6 +347,8 @@ impl TransactionQueue {
 		trace!(target: "txqueue", "Culled {} old transactions from sender {} (nonce={})",
 			removed_hashes.len(), address, cur_nonce);
 
+		self.notify(&removed_hashes, TxStatus::Culled);
+
 		for hash in removed_hashes {
 			self.by_hash.remove(&hash);
 		}
@@ -358,11 +364,26 @@ impl TransactionQueue {
 		self.listeners.push(f);
 	}
 
+	/// Add a transaction queue listener.
+	pub fn tx_statuses_receiver(&mut self) -> mpsc::UnboundedReceiver<Arc<Vec<(H256, TxStatus)>>> {
+		let (sender, receiver) = mpsc::unbounded();
+		self.tx_statuses_listeners.push(sender);
+		receiver
+	}
+
 	/// Notifies all listeners about new pending transaction.
-	fn notify(&self, hashes: &[H256]) {
+	fn notify(&mut self, hashes: &[H256], status: TxStatus) {
 		for listener in &self.listeners {
 			listener(hashes)
 		}
+
+		let to_send: Arc<Vec<(H256, TxStatus)>> = Arc::new(
+			hashes
+				.into_iter()
+				.map(|hash| (hash.clone(), status)).collect()
+		);
+
+		self.tx_statuses_listeners.retain(| listener| listener.unbounded_send(to_send.clone()).is_ok());
 	}
 }
 
@@ -370,7 +391,7 @@ impl TransactionQueue {
 mod tests {
 	use super::TransactionQueue;
 	use ethereum_types::Address;
-	use transaction::{Transaction, PendingTransaction, Condition};
+	use common_types::transaction::{Transaction, PendingTransaction, Condition};
 
 	#[test]
 	fn queued_senders() {

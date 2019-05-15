@@ -1,18 +1,18 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
-// This file is part of Parity.
+// Copyright 2015-2019 Parity Technologies (UK) Ltd.
+// This file is part of Parity Ethereum.
 
-// Parity is free software: you can redistribute it and/or modify
+// Parity Ethereum is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-// Parity is distributed in the hope that it will be useful,
+// Parity Ethereum is distributed in the hope that it will be useful,
 // but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
 // You should have received a copy of the GNU General Public License
-// along with Parity.  If not, see <http://www.gnu.org/licenses/>.
+// along with Parity Ethereum.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Simple Client used for EVM tests.
 
@@ -21,7 +21,8 @@ use std::sync::Arc;
 use ethereum_types::{H256, U256, H160};
 use {factory, journaldb, trie, kvdb_memorydb};
 use kvdb::{self, KeyValueDB};
-use {state, state_db, client, executive, trace, transaction, db, spec, pod_state, log_entry, receipt};
+use {state, state_db, client, executive, trace, db, spec, pod_state};
+use types::{log_entry, receipt, transaction};
 use factory::Factories;
 use evm::{VMType, FinalizationResult};
 use vm::{self, ActionParams};
@@ -66,6 +67,11 @@ use ethjson::spec::ForkSpec;
 pub struct EvmTestClient<'a> {
 	state: state::State<state_db::StateDB>,
 	spec: &'a spec::Spec,
+	dump_state: fn(&state::State<state_db::StateDB>) -> Option<pod_state::PodState>,
+}
+
+fn no_dump_state(_: &state::State<state_db::StateDB>) -> Option<pod_state::PodState> {
+	None
 }
 
 impl<'a> fmt::Debug for EvmTestClient<'a> {
@@ -87,37 +93,57 @@ impl<'a> EvmTestClient<'a> {
 			ForkSpec::EIP158 => Some(ethereum::new_eip161_test()),
 			ForkSpec::Byzantium => Some(ethereum::new_byzantium_test()),
 			ForkSpec::Constantinople => Some(ethereum::new_constantinople_test()),
+			ForkSpec::ConstantinopleFix => Some(ethereum::new_constantinople_fix_test()),
 			ForkSpec::EIP158ToByzantiumAt5 => Some(ethereum::new_transition_test()),
 			ForkSpec::FrontierToHomesteadAt5 | ForkSpec::HomesteadToDaoAt5 | ForkSpec::HomesteadToEIP150At5 => None,
 		}
 	}
 
+	/// Change default function for dump state (default does not dump)
+	pub fn set_dump_state_fn(&mut self, dump_state: fn(&state::State<state_db::StateDB>) -> Option<pod_state::PodState>) {
+		self.dump_state = dump_state;
+	}
+
 	/// Creates new EVM test client with in-memory DB initialized with genesis of given Spec.
-	pub fn new(spec: &'a spec::Spec) -> Result<Self, EvmTestError> {
-		let factories = Self::factories();
+	/// Takes a `TrieSpec` to set the type of trie.
+	pub fn new_with_trie(spec: &'a spec::Spec, trie_spec: trie::TrieSpec) -> Result<Self, EvmTestError> {
+		let factories = Self::factories(trie_spec);
 		let state =	Self::state_from_spec(spec, &factories)?;
 
 		Ok(EvmTestClient {
 			state,
 			spec,
+			dump_state: no_dump_state,
 		})
 	}
 
-	/// Creates new EVM test client with in-memory DB initialized with given PodState.
-	pub fn from_pod_state(spec: &'a spec::Spec, pod_state: pod_state::PodState) -> Result<Self, EvmTestError> {
-		let factories = Self::factories();
+	/// Creates new EVM test client with an in-memory DB initialized with genesis of given chain Spec.
+	pub fn new(spec: &'a spec::Spec) -> Result<Self, EvmTestError> {
+		Self::new_with_trie(spec, trie::TrieSpec::Secure)
+	}
+
+	/// Creates new EVM test client with an in-memory DB initialized with given PodState.
+	/// Takes a `TrieSpec` to set the type of trie.
+	pub fn from_pod_state_with_trie(spec: &'a spec::Spec, pod_state: pod_state::PodState, trie_spec: trie::TrieSpec) -> Result<Self, EvmTestError> {
+		let factories = Self::factories(trie_spec);
 		let state =	Self::state_from_pod(spec, &factories, pod_state)?;
 
 		Ok(EvmTestClient {
 			state,
 			spec,
+			dump_state: no_dump_state,
 		})
 	}
 
-	fn factories() -> Factories {
+	/// Creates new EVM test client with an in-memory DB initialized with given PodState.
+	pub fn from_pod_state(spec: &'a spec::Spec, pod_state: pod_state::PodState) -> Result<Self, EvmTestError> {
+		Self::from_pod_state_with_trie(spec, pod_state, trie::TrieSpec::Secure)
+	}
+
+	fn factories(trie_spec: trie::TrieSpec) -> Factories {
 		Factories {
 			vm: factory::VmFactory::new(VMType::Interpreter, 5 * 1024),
-			trie: trie::TrieFactory::new(trie::TrieSpec::Secure),
+			trie: trie::TrieFactory::new(trie_spec),
 			accountdb: Default::default(),
 		}
 	}
@@ -215,15 +241,17 @@ impl<'a> EvmTestClient<'a> {
 		transaction: transaction::SignedTransaction,
 		tracer: T,
 		vm_tracer: V,
-	) -> TransactResult<T::Output, V::Output> {
+	) -> std::result::Result<TransactSuccess<T::Output, V::Output>, TransactErr> {
 		let initial_gas = transaction.gas;
 		// Verify transaction
 		let is_ok = transaction.verify_basic(true, None, false);
 		if let Err(error) = is_ok {
-			return TransactResult::Err {
-				state_root: *self.state.root(),
-				error: error.into(),
-			};
+			return Err(
+				TransactErr{
+					state_root: *self.state.root(),
+					error: error.into(),
+					end_state: (self.dump_state)(&self.state),
+				});
 		}
 
 		// Apply transaction
@@ -247,12 +275,17 @@ impl<'a> EvmTestClient<'a> {
 			&None,
 			false
 		).ok();
+
 		self.state.commit().ok();
+
+		let state_root = *self.state.root();
+
+		let end_state = (self.dump_state)(&self.state);
 
 		match result {
 			Ok(result) => {
-				TransactResult::Ok {
-					state_root: *self.state.root(),
+				Ok(TransactSuccess {
+					state_root,
 					gas_left: initial_gas - result.receipt.gas_used,
 					outcome: result.receipt.outcome,
 					output: result.output,
@@ -263,44 +296,51 @@ impl<'a> EvmTestClient<'a> {
 						Some(executive::contract_address(scheme, &transaction.sender(), &transaction.nonce, &transaction.data).0)
 					} else {
 						None
-					}
+					},
+					end_state,
 				}
-			},
-			Err(error) => TransactResult::Err {
-				state_root: *self.state.root(),
+			)},
+			Err(error) => Err(TransactErr {
+				state_root,
 				error,
-			},
+				end_state,
+			}),
 		}
 	}
 }
 
-/// A result of applying transaction to the state.
-#[derive(Debug)]
-pub enum TransactResult<T, V> {
-	/// Successful execution
-	Ok {
-		/// State root
-		state_root: H256,
-		/// Amount of gas left
-		gas_left: U256,
-		/// Output
-		output: Vec<u8>,
-		/// Traces
-		trace: Vec<T>,
-		/// VM Traces
-		vm_trace: Option<V>,
-		/// Created contract address (if any)
-		contract_address: Option<H160>,
-		/// Generated logs
-		logs: Vec<log_entry::LogEntry>,
-		/// outcome
-		outcome: receipt::TransactionOutcome,
-	},
-	/// Transaction failed to run
-	Err {
-		/// State root
-		state_root: H256,
-		/// Execution error
-		error: ::error::Error,
-	},
+/// To be returned inside a std::result::Result::Ok after a successful
+/// transaction completed.
+#[allow(dead_code)]
+pub struct TransactSuccess<T, V> {
+	/// State root
+	pub state_root: H256,
+	/// Amount of gas left
+	pub gas_left: U256,
+	/// Output
+	pub output: Vec<u8>,
+	/// Traces
+	pub trace: Vec<T>,
+	/// VM Traces
+	pub vm_trace: Option<V>,
+	/// Created contract address (if any)
+	pub contract_address: Option<H160>,
+	/// Generated logs
+	pub logs: Vec<log_entry::LogEntry>,
+	/// outcome
+	pub outcome: receipt::TransactionOutcome,
+	/// end state if needed
+	pub end_state: Option<pod_state::PodState>,
+}
+
+/// To be returned inside a std::result::Result::Err after a failed
+/// transaction.
+#[allow(dead_code)]
+pub struct TransactErr {
+	/// State root
+	pub state_root: H256,
+	/// Execution error
+	pub error: ::error::Error,
+	/// end state if needed
+	pub end_state: Option<pod_state::PodState>,
 }
