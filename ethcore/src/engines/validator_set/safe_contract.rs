@@ -75,7 +75,7 @@ impl ::engines::StateDependentProof<EthereumMachine> for StateProof {
 pub struct ValidatorSafeContract {
 	contract_address: Address,
 	validators: RwLock<MemoryLruCache<H256, SimpleList>>,
-	client: RwLock<Option<Weak<EngineClient>>>, // TODO [keorn]: remove
+	client: RwLock<Option<Weak<dyn EngineClient>>>, // TODO [keorn]: remove
 }
 
 // first proof is just a state proof call of `getValidators` at header's state.
@@ -106,7 +106,7 @@ fn check_first_proof(machine: &EthereumMachine, contract_address: Address, old_h
 		timestamp: old_header.timestamp(),
 		last_hashes: {
 			// this will break if we don't inclue all 256 last hashes.
-			let mut last_hashes: Vec<_> = (0..256).map(|_| H256::default()).collect();
+			let mut last_hashes: Vec<_> = (0..256).map(|_| H256::zero()).collect();
 			last_hashes[255] = *old_header.parent_hash();
 			Arc::new(last_hashes)
 		},
@@ -117,7 +117,7 @@ fn check_first_proof(machine: &EthereumMachine, contract_address: Address, old_h
 	let number = old_header.number();
 	let (data, decoder) = validator_set::functions::get_validators::call();
 
-	let from = Address::default();
+	let from = Address::zero();
 	let tx = Transaction {
 		nonce: machine.account_start_nonce(number),
 		action: Action::Call(contract_address),
@@ -431,7 +431,7 @@ impl ValidatorSet for ValidatorSafeContract {
 				 }))
 	}
 
-	fn register_client(&self, client: Weak<EngineClient>) {
+	fn register_client(&self, client: Weak<dyn EngineClient>) {
 		trace!(target: "engine", "Setting up contract caller.");
 		*self.client.write() = Some(client);
 	}
@@ -516,7 +516,7 @@ mod tests {
 			nonce: 2.into(),
 			gas_price: 0.into(),
 			gas: 21000.into(),
-			action: Action::Call(Address::default()),
+			action: Action::Call(Address::zero()),
 			value: 0.into(),
 			data: Vec::new(),
 		}.sign(&s0, Some(chain_id));

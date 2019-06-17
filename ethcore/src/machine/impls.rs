@@ -60,14 +60,14 @@ impl From<::ethjson::spec::EthashParams> for EthashExtensions {
 		EthashExtensions {
 			homestead_transition: p.homestead_transition.map_or(0, Into::into),
 			dao_hardfork_transition: p.dao_hardfork_transition.map_or(u64::max_value(), Into::into),
-			dao_hardfork_beneficiary: p.dao_hardfork_beneficiary.map_or_else(Address::new, Into::into),
+			dao_hardfork_beneficiary: p.dao_hardfork_beneficiary.map_or_else(Address::zero, Into::into),
 			dao_hardfork_accounts: p.dao_hardfork_accounts.unwrap_or_else(Vec::new).into_iter().map(Into::into).collect(),
 		}
 	}
 }
 
 /// Special rules to be applied to the schedule.
-pub type ScheduleCreationRules = Fn(&mut Schedule, BlockNumber) + Sync + Send;
+pub type ScheduleCreationRules = dyn Fn(&mut Schedule, BlockNumber) + Sync + Send;
 
 /// An ethereum-like state machine.
 pub struct EthereumMachine {
@@ -203,7 +203,7 @@ impl EthereumMachine {
 				block,
 				params.eip210_contract_address,
 				params.eip210_contract_gas,
-				Some(parent_hash.to_vec()),
+				Some(parent_hash.as_bytes().to_vec()),
 			)?;
 		}
 		Ok(())
@@ -415,7 +415,7 @@ pub struct AuxiliaryData<'a> {
 
 /// Type alias for a function we can make calls through synchronously.
 /// Returns the call result and state proof for each call.
-pub type Call<'a> = Fn(Address, Vec<u8>) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> + 'a;
+pub type Call<'a> = dyn Fn(Address, Vec<u8>) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> + 'a;
 
 /// Request for auxiliary data of a block.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -429,7 +429,7 @@ pub enum AuxiliaryRequest {
 }
 
 impl super::Machine for EthereumMachine {
-	type EngineClient = ::client::EngineClient;
+	type EngineClient = dyn (::client::EngineClient);
 
 	type Error = Error;
 
@@ -462,12 +462,13 @@ fn round_block_gas_limit(gas_limit: U256, lower_limit: U256, upper_limit: U256) 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::str::FromStr;
 
 	fn get_default_ethash_extensions() -> EthashExtensions {
 		EthashExtensions {
 			homestead_transition: 1150000,
 			dao_hardfork_transition: u64::max_value(),
-			dao_hardfork_beneficiary: "0000000000000000000000000000000000000001".into(),
+			dao_hardfork_beneficiary: Address::from_str("0000000000000000000000000000000000000001").unwrap(),
 			dao_hardfork_accounts: Vec::new(),
 		}
 	}

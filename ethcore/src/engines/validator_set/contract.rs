@@ -37,7 +37,7 @@ use_contract!(validator_report, "res/contracts/validator_report.json");
 pub struct ValidatorContract {
 	contract_address: Address,
 	validators: ValidatorSafeContract,
-	client: RwLock<Option<Weak<EngineClient>>>, // TODO [keorn]: remove
+	client: RwLock<Option<Weak<dyn EngineClient>>>, // TODO [keorn]: remove
 }
 
 impl ValidatorContract {
@@ -125,7 +125,7 @@ impl ValidatorSet for ValidatorContract {
 		}
 	}
 
-	fn register_client(&self, client: Weak<EngineClient>) {
+	fn register_client(&self, client: Weak<dyn EngineClient>) {
 		self.validators.register_client(client.clone());
 		*self.client.write() = Some(client);
 	}
@@ -175,7 +175,7 @@ mod tests {
 
 		// Check a block that is a bit in future, reject it but don't report the validator.
 		let mut header = Header::default();
-		let seal = vec![encode(&4u8), encode(&(&H520::default() as &[u8]))];
+		let seal = vec![encode(&4u8), encode(&H520::zero().as_bytes())];
 		header.set_seal(seal);
 		header.set_author(v1);
 		header.set_number(2);
@@ -186,7 +186,7 @@ mod tests {
 
 		// Now create one that is more in future. That one should be rejected and validator should be reported.
 		let mut header = Header::default();
-		let seal = vec![encode(&8u8), encode(&(&H520::default() as &[u8]))];
+		let seal = vec![encode(&8u8), encode(&H520::zero().as_bytes())];
 		header.set_seal(seal);
 		header.set_author(v1);
 		header.set_number(2);

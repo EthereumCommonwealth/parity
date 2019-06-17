@@ -66,7 +66,7 @@ impl CodeState {
 // account address hash, account properties and the storage. Each item contains at most `max_storage_items`
 // storage records split according to snapshot format definition.
 pub fn to_fat_rlps(account_hash: &H256, acc: &BasicAccount, acct_db: &AccountDB, used_code: &mut HashSet<H256>, first_chunk_size: usize, max_chunk_size: usize) -> Result<Vec<Bytes>, Error> {
-	let db = &(acct_db as &HashDB<_,_>);
+	let db = &(acct_db as &dyn HashDB<_,_>);
 	let db = TrieDB::new(db, &acc.storage_root)?;
 	let mut chunks = Vec::new();
 	let mut db_iter = db.iter()?;
@@ -350,6 +350,6 @@ mod tests {
 	#[test]
 	fn encoding_empty_acc() {
 		let mut db = get_temp_state_db();
-		assert_eq!(from_fat_rlp(&mut AccountDBMut::new(db.as_hash_db_mut(), &Address::default()), Rlp::new(&::rlp::NULL_RLP), H256::zero()).unwrap(), (ACC_EMPTY, None));
+		assert_eq!(from_fat_rlp(&mut AccountDBMut::new(db.as_hash_db_mut(), &Address::zero()), Rlp::new(&::rlp::NULL_RLP), H256::zero()).unwrap(), (ACC_EMPTY, None));
 	}
 }
