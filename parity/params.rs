@@ -41,6 +41,7 @@ pub enum SpecType {
 	Ellaism,
 	Mix,
 	Callisto,
+	Galilei,
 	Morden,
 	Ropsten,
 	Kovan,
@@ -72,6 +73,7 @@ impl str::FromStr for SpecType {
 			"ellaism" => SpecType::Ellaism,
 			"mix" => SpecType::Mix,
 			"callisto" => SpecType::Callisto,
+			"galilei" => SpecType::Galilei,
 			"morden" | "classic-testnet" => SpecType::Morden,
 			"ropsten" => SpecType::Ropsten,
 			"kovan" | "testnet" => SpecType::Kovan,
@@ -98,6 +100,7 @@ impl fmt::Display for SpecType {
 			SpecType::Ellaism => "ellaism",
 			SpecType::Mix => "mix",
 			SpecType::Callisto => "callisto",
+			SpecType::Galilei => "galilei",
 			SpecType::Morden => "morden",
 			SpecType::Ropsten => "ropsten",
 			SpecType::Kovan => "kovan",
@@ -124,6 +127,7 @@ impl SpecType {
 			SpecType::Ellaism => Ok(ethereum::new_ellaism(params)),
 			SpecType::Mix => Ok(ethereum::new_mix(params)),
 			SpecType::Callisto => Ok(ethereum::new_callisto(params)),
+			SpecType::Galilei => Ok(ethereum::new_galilei(params)),
 			SpecType::Morden => Ok(ethereum::new_morden(params)),
 			SpecType::Ropsten => Ok(ethereum::new_ropsten(params)),
 			SpecType::Kovan => Ok(ethereum::new_kovan(params)),
@@ -379,6 +383,7 @@ mod tests {
 		assert_eq!(SpecType::Ellaism, "ellaism".parse().unwrap());
 		assert_eq!(SpecType::Mix, "mix".parse().unwrap());
 		assert_eq!(SpecType::Callisto, "callisto".parse().unwrap());
+		assert_eq!(SpecType::Galilei, "galilei".parse().unwrap());
 		assert_eq!(SpecType::Morden, "morden".parse().unwrap());
 		assert_eq!(SpecType::Morden, "classic-testnet".parse().unwrap());
 		assert_eq!(SpecType::Ropsten, "ropsten".parse().unwrap());
@@ -408,6 +413,7 @@ mod tests {
 		assert_eq!(format!("{}", SpecType::Ellaism), "ellaism");
 		assert_eq!(format!("{}", SpecType::Mix), "mix");
 		assert_eq!(format!("{}", SpecType::Callisto), "callisto");
+		assert_eq!(format!("{}", SpecType::Galilei), "galilei");
 		assert_eq!(format!("{}", SpecType::Morden), "morden");
 		assert_eq!(format!("{}", SpecType::Ropsten), "ropsten");
 		assert_eq!(format!("{}", SpecType::Kovan), "kovan");
